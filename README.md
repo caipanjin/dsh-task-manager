@@ -1,101 +1,65 @@
 # dsh-task-manager
 
-Tasks in the DeepSeek Harness chat: the model proposes them, you add them, and a
-single click hands one to the model to start.
+在 DeepSeek Harness 的聊天里管理任务：模型会提议任务，你也可以自己添加，点一下就能把某个任务交给模型开始执行。
 
-A tiny, dependency-free plugin that gives the Harness a floating task panel. Task
-items can come from **the model itself** (e.g. it suggests an implementation order)
-or from **you** (typed in the panel). Each task shows its origin — *Model* vs
-*Mine* — so you always know where it came from. When the model reports a task as
-finished, the panel raises a **bulk confirmation** prompt instead of silently
-marking things done: you decide. Pick a task and hit **Start** to drop
-`Start this task: <title>` into the conversation and let the model begin.
+一个无依赖的小插件，为 Harness 提供一个**悬浮任务面板**。任务可以来自**模型本身**（比如它给出一个实施顺序建议），也可以来自**你自己**（在面板里手动输入）。每条任务都会标注来源——**模型建议** 还是 **手动添加**——让你随时清楚它的出处。当模型判断某个任务已完成时，面板不会悄悄把任务标为完成，而是弹出一个**批量确认**提示，由你来拍板。选中某条任务点「开始」，就会把「开始执行这个任务：<标题>」发送到对话框，交给模型执行。
 
-![Task manager panel](docs/task-panel.png)
+![任务面板](docs/task-panel.png)
 
-## Features
+## 功能特性
 
-- **Two sources of tasks** — model-suggested (via the `task_write` tool) and
-  user-added (typed in the panel), with a per-row origin badge (**Model** /
-  **Mine**).
-- **Floating, draggable panel** — lives in the shell overlay, opens from a compact
-  pill, can be dragged anywhere and remembers where you left it (per browser).
-- **Explicit completion + confirm-before-done** — every task has a **Complete**
-  action; when the model judges tasks done it only *proposes* it, and the panel
-  shows a **Confirm all / Dismiss** banner. Nothing is finalized without you.
-- **Start a task from the list** — **Start** sends the task to the chat so the
-  model picks it up; the panel then gets out of the way.
-- **Light & dark** — uses only real Harness theme tokens, so it follows the app
-  theme automatically.
-- **Bilingual** — English and 简体中文.
+- **两种任务来源** —— 模型建议（通过 `task_write` 工具）与用户手动添加（在面板输入），每行带来源徽标（**模型建议** / **手动添加**）。
+- **悬浮、可拖动面板** —— 位于 shell 浮层之上，从一个紧凑的小胶囊展开，可拖到任意位置并记住位置（按浏览器保存）。
+- **显式完成 + 先确认后完成** —— 每条任务都有「完成」操作；当模型判断任务完成时，只是**提议**完成，面板会显示 **全部确认 / 忽略** 横幅。未经你确认，不会真正落定。
+- **从列表直接启动任务** —— 点「开始」会把任务发到聊天，让模型接手；随后面板自动收起让路。
+- **浅色 / 深色自适应** —— 只使用 Harness 真实主题 token，自动跟随应用主题。
+- **中英双语** —— 简体中文与 English。
 
-## Install
+## 安装
 
-Published on npm:
+已发布到 npm：
 
 ```bash
 dsh plugin --profile web add @caipj/dsh-task-manager
 ```
 
-Or straight from source:
+或直接从源码安装：
 
 ```bash
 dsh plugin --profile web add github:caipanjin/dsh-task-manager
 ```
 
-Then restart the Harness host once so the host-side tool
-(`task_write`) registers, and reload the window. The task pill appears in the
-bottom-right; click it to expand, drag it to move.
+安装后重启一次 Harness 宿主（让宿主侧工具 `task_write` 注册生效），并刷新窗口。任务小胶囊会出现在右下角；点击展开，拖动可移动。
 
-## Usage
+## 使用说明
 
-- **Add a task**: expand the pill and type into the input, then **Add**. It stays
-  in the list — it is not copied into the chat.
-- **Model tasks**: when the model calls `task_write` (e.g. proposes an order of
-  work), the tasks appear automatically, badged **Model**.
-- **Start a task**: click **Start** on a row — the prompt is sent to the
-  conversation.
-- **Complete**: click **Complete** on a row. If the model reports completion, a
-  confirmation banner appears; use **Confirm all** or per-row **Confirm**.
-- **Remove / clear**: user tasks have a **✕**; **Clear done** removes finished
-  ones.
+- **添加任务**：展开胶囊，在输入框里输入后点「添加」。任务只留在列表里——**不会**被复制到聊天框。
+- **模型任务**：当模型调用 `task_write`（例如提议一个工作顺序）时，任务会自动出现，标注「模型建议」。
+- **启动任务**：点某行的「开始」，提示会被发送到对话。
+- **完成**：点某行的「完成」。若模型报告完成，会出现确认横幅，可用「全部确认」或逐行「确认」。
+- **删除 / 清空**：用户任务带「✕」；「清除已完成」可移除已完成项。
 
-## How it works
+## 工作原理
 
-- **Host half** (`index.js`) registers a model-facing tool `task_write`
-  (`add` / `set_status` / `propose_done` / `remove` / `replace` / `clear` /
-  `list`) and a session projection `taskManager`. The tool's rendered result
-  embeds one machine marker line `TASK_STATE::<json>` carrying the full list; the
-  projection folds those markers out of the existing `tool/result` event — no
-  custom session event type is introduced.
-- **Client half** (`client.js`) registers a widget into the `shell.overlay` slot.
-  It reads model tasks from the projection and keeps user tasks + confirmations
-  in `localStorage` (installed plugins cannot write the host projection, so
-  confirmations are client-side by design). **Start** calls the active session's
-  `conversation.send(text)`.
+- **宿主端**（`index.js`）注册一个面向模型的工具 `task_write`（`add` / `set_status` / `propose_done` / `remove` / `replace` / `clear` / `list`）以及一个会话投影 `taskManager`。工具的渲染结果内嵌一行机器标记 `TASK_STATE::<json>`，携带完整任务列表；投影从既有的 `tool/result` 事件中折叠出这些标记——不引入任何自定义会话事件类型。
+- **客户端**（`client.js`）把一个挂件注册到 `shell.overlay` 插槽。它从投影读取模型任务，并把用户任务与确认状态保存在 `localStorage`（已安装插件无法写入宿主投影，因此确认状态按设计放在客户端）。**开始** 调用当前会话的 `conversation.send(text)`。
 
-## Compatibility
+## 兼容性
 
-- Platform: **web** (the Harness desktop/web UI).
-- Requires a Harness build that exposes the `shell.overlay` slot, the
-  `sessionProjections` service, and the `conversation.send` / `sessions.scope`
-  client services. Uses only public, stable theme tokens
-  (`--dsw-alias-*`).
+- 平台：**web**（Harness 桌面 / 网页 UI）。
+- 需要暴露 `shell.overlay` 插槽、`sessionProjections` 服务，以及 `conversation.send` / `sessions.scope` 客户端服务的 Harness 版本。仅使用公开、稳定的主题 token（`--dsw-alias-*`）。
 
-## Permissions / trust
+## 权限 / 信任
 
-- No network access, no external services, no telemetry.
-- Reads the session projection for tasks; writes only its own `localStorage` keys
-  under `@caipj/dsh-task-manager:*`.
-- Adds one model tool (`task_write`). Nothing else is touched.
+- 无网络请求、无外部服务、无遥测。
+- 读取会话投影中的任务；仅写入自己的 `localStorage` 键 `@caipj/dsh-task-manager:*`。
+- 新增一个模型工具（`task_write`），不触碰其他任何东西。
 
-## Known limitations
+## 已知限制
 
-- Bulk "confirm done" state is stored per session in `localStorage`; it is not
-  written back into the session log (by design for a third-party plugin).
-- User tasks are local to the browser/session, not synced into the model context
-  until you **Start** one.
+- 批量「确认完成」状态按会话存于 `localStorage`，不回写会话日志（第三方插件按设计如此）。
+- 用户任务只存在于本地浏览器/会话，在你点「开始」之前不会进入模型上下文。
 
-## License
+## 许可证
 
 [MIT](LICENSE) © caipanjin
