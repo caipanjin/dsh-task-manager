@@ -232,6 +232,52 @@ window.__ModuleLoader__.load({
       return items.filter(Boolean);
     }
 
+    // ---- selection → task titles --------------------------------------------
+    //
+    // Markdown lists are rendered as REAL <ul>/<ol> + <li> elements, and the
+    // "-" / "1." marker is NOT part of the text — it is drawn by CSS (::marker).
+    // So `selection.toString()` returns the item text WITHOUT any marker, which
+    // means the line-based LIST_ITEM_RE below can never recognise a rendered
+    // list. Reading the DOM is the only way to tell that the user selected a
+    // list; the text parsers stay as the fallback for literal markers typed in
+    // plain text or inside a code block.
+    function ownListItemText(li) {
+      let out = '';
+      const walk = (node) => {
+        if (node.nodeType === 3) { out += node.nodeValue; return; }
+        if (node.nodeType !== 1) return;
+        // Skip nested lists so a parent item does not swallow its children.
+        if (node !== li && (node.tagName === 'LI' || node.tagName === 'UL' || node.tagName === 'OL')) return;
+        for (let i = 0; i < node.childNodes.length; i += 1) walk(node.childNodes[i]);
+      };
+      walk(li);
+      return out.replace(/\s+/g, ' ').trim();
+    }
+    function selectionDomListItems(sel) {
+      let range = null;
+      try { range = sel.getRangeAt(0); } catch { return []; }
+      let all = [];
+      try { all = Array.prototype.slice.call(document.querySelectorAll('li')); } catch { return []; }
+      const items = [];
+      const seen = new Set();
+      for (const li of all) {
+        let hit = false;
+        try { hit = range.intersectsNode(li); } catch { hit = false; }
+        if (!hit) continue;
+        const text = ownListItemText(li);
+        if (!text || seen.has(text)) continue;
+        seen.add(text);
+        items.push(text);
+      }
+      return items.length >= 2 ? items : [];
+    }
+    // Titles for the current selection: DOM list first, text heuristics after.
+    function selectionToTitles(sel, text) {
+      const fromDom = selectionDomListItems(sel);
+      if (fromDom.length >= 2) return fromDom;
+      return parseSelectionToTasks(text);
+    }
+
     const taskBus = {
       _subs: new Set(),
       subscribe(fn) {
@@ -930,7 +976,7 @@ window.__ModuleLoader__.load({
     // of reasonable length, and ignore selections made inside our own card.
     function SelectionBubble(props) {
       const { t } = props;
-      const [state, setState] = React.useState({ visible: false, x: 0, y: 0, text: '' });
+      const [state, setState] = React.useState({ visible: false, x: 0, y: 0, text: '', titles: [] });
 
       React.useEffect(() => {
         function insideOwnUi(node) {
@@ -975,7 +1021,11 @@ window.__ModuleLoader__.load({
           }
           x = Math.max(MARGIN, x);
           y = Math.max(MARGIN, y);
-          setState({ visible: true, x, y, text });
+          // Resolve the titles ONCE here, while we still hold the live selection
+          // (and its DOM), and carry them in state. Recomputing later from the
+          // plain text alone would lose rendered <li> structure.
+          const titles = selectionToTitles(sel, text);
+          setState({ visible: true, x, y, text, titles });
         }
 
         // Primary trigger: `selectionchange` fires reliably on every selection
@@ -1032,14 +1082,15 @@ window.__ModuleLoader__.load({
       function handleAdd(e) {
         e.preventDefault();
         e.stopPropagation();
-        const titles = parseSelectionToTasks(state.text);
+        const titles = state.titles && state.titles.length ? state.titles : parseSelectionToTasks(state.text);
         if (titles.length) taskBus.emit(titles);
         setState((s) => ({ ...s, visible: false }));
         try { window.getSelection().removeAllRanges(); } catch { /* ignore */ }
       }
 
       if (!state.visible) return null;
-      const count = parseSelectionToTasks(state.text).length;
+      const titles = state.titles && state.titles.length ? state.titles : parseSelectionToTasks(state.text);
+      const count = titles.length;
       const label = count > 1 ? t('addAsTasksN').replace('{n}', String(count)) : t('addAsTask');
       // Viewport-anchored (position:fixed) because we align to the native
       // selection pill via getBoundingClientRect() (viewport coords). The
