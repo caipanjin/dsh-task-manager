@@ -71,6 +71,8 @@ window.__ModuleLoader__.load({
       confirm: 'Confirm',
       dismiss: 'Dismiss',
       confirmDismissed: 'Dismissed',
+      addAsTask: 'Add as task',
+      addedAsTask: 'Added to tasks',
     };
 
     // Flat dictionaries registered with the locale service (locale/*.json only
@@ -107,6 +109,8 @@ window.__ModuleLoader__.load({
       confirm: '确认',
       dismiss: '忽略',
       confirmDismissed: '已忽略',
+      addAsTask: '添加为任务',
+      addedAsTask: '已加入任务',
     };
 
     function fill(template, vars) {
@@ -151,6 +155,27 @@ window.__ModuleLoader__.load({
       userSeq += 1;
       return `u${Date.now().toString(36)}${userSeq.toString(36)}`;
     }
+
+    // ---- cross-component "add to tasks" bus ---------------------------------
+    //
+    // The selection bubble lives in a SEPARATE overlay entry from the task card,
+    // so it cannot reach the card's local React state directly. Instead it pushes
+    // a text payload here; the card subscribes, appends it as a user task, and
+    // expands itself. One shared module-level emitter (the factory runs once).
+    const taskBus = {
+      _subs: new Set(),
+      subscribe(fn) {
+        taskBus._subs.add(fn);
+        return () => taskBus._subs.delete(fn);
+      },
+      emit(text) {
+        const title = String(text || '').trim();
+        if (!title) return;
+        taskBus._subs.forEach((fn) => {
+          try { fn(title); } catch { /* ignore one bad subscriber */ }
+        });
+      },
+    };
 
     // ---- per-session confirmation store (model-task done proposals) ---------
     //
@@ -265,6 +290,24 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         setUserTasks(loadUserTasks(sessionId));
       }, [sessionId]);
+
+      // A selection bubble elsewhere in the overlay can push text here; append it
+      // as a user task and expand the card so the user sees it land. We read the
+      // latest sessionId via a ref so the subscription stays stable.
+      const sessionRef = React.useRef(sessionId);
+      sessionRef.current = sessionId;
+      React.useEffect(() => {
+        return taskBus.subscribe((title) => {
+          const sid = sessionRef.current;
+          if (!sid) return;
+          const current = loadUserTasks(sid);
+          const task = { id: mintUserId(), title, status: 'todo', origin: 'user' };
+          const next = [...current, task];
+          saveUserTasks(sid, next);
+          setUserTasks(next);
+          setOpen(true);
+        });
+      }, []);
 
       const [draft, setDraft] = React.useState('');
       const [open, setOpen] = React.useState(false);
@@ -540,7 +583,7 @@ window.__ModuleLoader__.load({
 
       // ---- collapsed pill ----------------------------------------------------
       if (!open) {
-        return h('div', { style: wrapStyle, 'data-task-manager': '' },
+        return h('div', { style: wrapStyle, 'data-task-manager': '', 'data-tm-ui': '1' },
           h('button', {
             style: styles.pill,
             title: t('openPanel'),
@@ -567,7 +610,7 @@ window.__ModuleLoader__.load({
       }
 
       // ---- expanded card -----------------------------------------------------
-      return h('div', { style: wrapStyle, 'data-task-manager': '' },
+      return h('div', { style: wrapStyle, 'data-task-manager': '', 'data-tm-ui': '1' },
         h('div', { style: styles.card },
           h('div', { style: styles.header, onMouseDown: beginDrag, title: t('dragHint') },
             h('span', { style: styles.headerIcon }, h(TaskGlyph, { size: 15 })),
@@ -798,9 +841,97 @@ window.__ModuleLoader__.load({
       };
     }
 
-    // ---- icon ---------------------------------------------------------------
+    // ---- selection bubble ---------------------------------------------------
+    //
+    // A tiny floating "+任务" button that appears next to the user's text
+    // selection anywhere in the app. Clicking it pushes the selected text into
+    // the task bus (added as a user task). We only react to non-empty selections
+    // of reasonable length, and ignore selections made inside our own card.
+    function SelectionBubble(props) {
+      const { t } = props;
+      const [state, setState] = React.useState({ visible: false, x: 0, y: 0, text: '' });
 
-    // Simple checklist glyph, drawn with currentColor so it follows the theme.
+      React.useEffect(() => {
+        function insideOwnUi(node) {
+          let el = node && node.nodeType === 3 ? node.parentElement : node;
+          while (el && el !== document.body) {
+            if (el.getAttribute && el.getAttribute('data-tm-ui') === '1') return true;
+            el = el.parentElement;
+          }
+          return false;
+        }
+
+        function onMouseUp(e) {
+          // Let the click settle so the selection is final.
+          setTimeout(() => {
+            const sel = window.getSelection();
+            if (!sel || sel.isCollapsed || sel.rangeCount === 0) return;
+            const text = String(sel.toString() || '').trim();
+            if (!text || text.length > 800) return;
+            if (insideOwnUi(sel.anchorNode) || insideOwnUi(sel.focusNode)) return;
+            if (insideOwnUi(e.target)) return;
+            let rect = null;
+            try { rect = sel.getRangeAt(0).getBoundingClientRect(); } catch { rect = null; }
+            const x = rect ? Math.min(window.innerWidth - 120, Math.max(8, rect.left + rect.width / 2 - 48)) : 8;
+            const y = rect ? Math.max(8, rect.top - 38) : 8;
+            setState({ visible: true, x, y, text });
+          }, 10);
+        }
+
+        function onMouseDown(e) {
+          const el = e.target;
+          if (el && el.closest && el.closest('[data-tm-bubble="1"]')) return;
+          setState((s) => (s.visible ? { ...s, visible: false } : s));
+        }
+        function onHide() { setState((s) => (s.visible ? { ...s, visible: false } : s)); }
+        function onKeyDown(e) { if (e.key === 'Escape') onHide(); }
+
+        document.addEventListener('mouseup', onMouseUp, true);
+        document.addEventListener('mousedown', onMouseDown, true);
+        document.addEventListener('keydown', onKeyDown, true);
+        window.addEventListener('scroll', onHide, true);
+        window.addEventListener('resize', onHide, true);
+        return () => {
+          document.removeEventListener('mouseup', onMouseUp, true);
+          document.removeEventListener('mousedown', onMouseDown, true);
+          document.removeEventListener('keydown', onKeyDown, true);
+          window.removeEventListener('scroll', onHide, true);
+          window.removeEventListener('resize', onHide, true);
+        };
+      }, []);
+
+      function handleAdd(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        taskBus.emit(state.text);
+        setState((s) => ({ ...s, visible: false }));
+        try { window.getSelection().removeAllRanges(); } catch { /* ignore */ }
+      }
+
+      if (!state.visible) return null;
+      return h('div', {
+        'data-tm-ui': '1',
+        'data-tm-bubble': '1',
+        style: { position: 'fixed', left: `${state.x}px`, top: `${state.y}px`, zIndex: 100000, pointerEvents: 'auto' },
+      }, h('button', {
+        type: 'button',
+        onMouseDown: (e) => e.preventDefault(),
+        onClick: handleAdd,
+        title: t('addAsTask'),
+        style: {
+          display: 'inline-flex', alignItems: 'center', gap: '4px',
+          padding: '4px 10px', fontSize: '12px', lineHeight: '18px',
+          cursor: 'pointer', borderRadius: '6px',
+          border: '1px solid var(--dsw-alias-border-l1)',
+          background: 'var(--dsw-alias-brand-primary)',
+          color: 'var(--dsw-alias-bg-base)',
+          boxShadow: '0 2px 8px rgba(0,0,0,0.25)',
+          whiteSpace: 'nowrap',
+        },
+      }, `+ ${t('addAsTask')}`));
+    }
+
+    // ---- icon ---------------------------------------------------------------
     const ICON_PATH =
       'M2 3.5h2v2H2v-2zm4 0.25h8v1.5H6v-1.5zM2 7.25h2v2H2v-2zm4 0.25h8v1.5H6V7.5zM2 11h2v2H2v-2zm4 0.25h8v1.5H6v-1.5z';
 
@@ -850,6 +981,7 @@ window.__ModuleLoader__.load({
         };
 
         let disposeOverlay = null;
+        let disposeBubble = null;
 
         const mount = () => {
           if (disposeOverlay) return;
@@ -860,10 +992,26 @@ window.__ModuleLoader__.load({
             label: () => bindT()('title'),
             locale: NS,
           }, (props) => h(TaskWidget, { ...props, ctx, t: bindT() }));
+          // The selection bubble is a second, independent overlay entry (order 51)
+          // that floats next to any text the user highlights. It feeds the task
+          // bus so the card above picks the text up as a user task.
+          if (!disposeBubble) {
+            try {
+              disposeBubble = ctx.slots.register({
+                name: 'shell.overlay',
+                id: `${OVERLAY_ID}-bubble`,
+                order: 51,
+                locale: NS,
+              }, (props) => h(SelectionBubble, { ...props, t: bindT() }));
+            } catch {
+              disposeBubble = null;
+            }
+          }
         };
 
         const unmount = () => {
           if (disposeOverlay) { try { disposeOverlay(); } catch {} disposeOverlay = null; }
+          if (disposeBubble) { try { disposeBubble(); } catch {} disposeBubble = null; }
         };
 
         ctx.slots.inject('shell.overlay', () => {
