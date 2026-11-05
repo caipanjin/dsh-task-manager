@@ -842,8 +842,8 @@ window.__ModuleLoader__.load({
           whiteSpace: 'nowrap',
         },
         card: {
-          // 340 → 510 (+50% expanded width)
-          width: '510px',
+          // 510 → 340 (-1/3, so the width itself proves a fresh bundle)
+          width: '340px',
           maxWidth: 'calc(100vw - 40px)',
           maxHeight: 'min(60vh, 520px)',
           display: 'flex',
