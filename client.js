@@ -72,6 +72,7 @@ window.__ModuleLoader__.load({
       dismiss: 'Dismiss',
       confirmDismissed: 'Dismissed',
       addAsTask: 'Add as task',
+      addAsTasksN: 'Add {n} tasks',
       addedAsTask: 'Added to tasks',
     };
 
@@ -110,6 +111,7 @@ window.__ModuleLoader__.load({
       dismiss: '忽略',
       confirmDismissed: '已忽略',
       addAsTask: '添加为任务',
+      addAsTasksN: '添加 {n} 个任务',
       addedAsTask: '已加入任务',
     };
 
@@ -162,17 +164,56 @@ window.__ModuleLoader__.load({
     // so it cannot reach the card's local React state directly. Instead it pushes
     // a text payload here; the card subscribes, appends it as a user task, and
     // expands itself. One shared module-level emitter (the factory runs once).
+    // Split a selected block of text into one title per list item when it looks
+    // like a bulleted / numbered list ("- a", "* b", "1. c", "2) d", "• e").
+    // Otherwise return a single title (the whole trimmed selection).
+    //
+    // Rules:
+    //  - If at least 2 lines carry a list marker, treat it as a list and emit
+    //    ONE task per item, stripping the marker. Wrapped continuation lines
+    //    (no marker) are appended to the previous item so multi-line bullets
+    //    stay one task.
+    //  - Leading/trailing blank lines are ignored.
+    const LIST_ITEM_RE = /^\s*(?:[-*•·▪◦]|\d+[.)、]|[①-⑳]|\(\d+\))\s*(.+?\S)\s*$/;
+    function parseSelectionToTasks(raw) {
+      const text = String(raw == null ? '' : raw).replace(/\r\n?/g, '\n').trim();
+      if (!text) return [];
+      const lines = text.split('\n');
+      const markerCount = lines.filter((l) => LIST_ITEM_RE.test(l)).length;
+      // Not a real list (fewer than 2 marked lines) → keep the whole selection
+      // as a single task verbatim.
+      if (markerCount < 2) return [text];
+      const items = [];
+      let started = false;
+      for (const line of lines) {
+        const m = line.match(LIST_ITEM_RE);
+        if (m) {
+          started = true;
+          items.push(m[1].trim());
+        } else if (started && items.length && line.trim()) {
+          // Continuation (wrapped) line of the current bullet.
+          items[items.length - 1] = `${items[items.length - 1]} ${line.trim()}`.trim();
+        }
+        // Any unmarked line BEFORE the first bullet (e.g. "说明如下：") is dropped.
+      }
+      return items.filter(Boolean);
+    }
+
     const taskBus = {
       _subs: new Set(),
       subscribe(fn) {
         taskBus._subs.add(fn);
         return () => taskBus._subs.delete(fn);
       },
-      emit(text) {
-        const title = String(text || '').trim();
-        if (!title) return;
+      emit(payload) {
+        // Accept a single string OR an array of strings (a selected list becomes
+        // several tasks). Normalize to a non-empty array of trimmed titles.
+        const list = (Array.isArray(payload) ? payload : [payload])
+          .map((s) => String(s == null ? '' : s).trim())
+          .filter(Boolean);
+        if (!list.length) return;
         taskBus._subs.forEach((fn) => {
-          try { fn(title); } catch { /* ignore one bad subscriber */ }
+          try { fn(list); } catch { /* ignore one bad subscriber */ }
         });
       },
     };
@@ -297,12 +338,12 @@ window.__ModuleLoader__.load({
       const sessionRef = React.useRef(sessionId);
       sessionRef.current = sessionId;
       React.useEffect(() => {
-        return taskBus.subscribe((title) => {
+        return taskBus.subscribe((titles) => {
           const sid = sessionRef.current;
           if (!sid) return;
           const current = loadUserTasks(sid);
-          const task = { id: mintUserId(), title, status: 'todo', origin: 'user' };
-          const next = [...current, task];
+          const added = titles.map((title) => ({ id: mintUserId(), title, status: 'todo', origin: 'user' }));
+          const next = [...current, ...added];
           saveUserTasks(sid, next);
           setUserTasks(next);
           setOpen(true);
@@ -554,7 +595,12 @@ window.__ModuleLoader__.load({
           h('span', {
             style: labelStyle,
             title: task.detail ? `${task.title} — ${task.detail}` : task.title,
-          }, task.title),
+          },
+            h('span', { style: styles.labelTitle }, task.title),
+            task.detail
+              ? h('span', { style: styles.labelDetail }, task.detail)
+              : null,
+          ),
           pending
             ? h('span', { style: styles.pendingBadge, title: t('proposed') }, t('proposed'))
             : null,
@@ -801,7 +847,7 @@ window.__ModuleLoader__.load({
         bodyInner: { display: 'flex', flexDirection: 'column', gap: '8px' },
         list: { listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: '4px' },
         row: {
-          display: 'flex', alignItems: 'center', gap: '6px',
+          display: 'flex', alignItems: 'flex-start', gap: '6px',
           padding: '6px 8px', borderRadius: '8px',
           border: `1px solid ${C.border}`,
           background: C.surface2,
@@ -817,7 +863,9 @@ window.__ModuleLoader__.load({
           color: C.text2,
           whiteSpace: 'nowrap',
         },
-        label: { flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: C.text },
+        label: { flex: '1 1 auto', minWidth: 0, display: 'flex', flexDirection: 'column', gap: '1px', color: C.text },
+        labelTitle: { overflowWrap: 'anywhere', wordBreak: 'break-word', whiteSpace: 'normal', lineHeight: '18px' },
+        labelDetail: { overflowWrap: 'anywhere', wordBreak: 'break-word', whiteSpace: 'normal', color: C.text2, fontSize: '11px', lineHeight: '16px' },
         doneLabel: { textDecoration: 'line-through', opacity: 0.65 },
         btn: {
           flex: '0 0 auto',
@@ -861,38 +909,96 @@ window.__ModuleLoader__.load({
           return false;
         }
 
-        function onMouseUp(e) {
-          // Let the click settle so the selection is final.
-          setTimeout(() => {
-            const sel = window.getSelection();
-            if (!sel || sel.isCollapsed || sel.rangeCount === 0) return;
-            const text = String(sel.toString() || '').trim();
-            if (!text || text.length > 800) return;
-            if (insideOwnUi(sel.anchorNode) || insideOwnUi(sel.focusNode)) return;
-            if (insideOwnUi(e.target)) return;
-            let rect = null;
-            try { rect = sel.getRangeAt(0).getBoundingClientRect(); } catch { rect = null; }
-            const x = rect ? Math.min(window.innerWidth - 120, Math.max(8, rect.left + rect.width / 2 - 48)) : 8;
-            const y = rect ? Math.max(8, rect.top - 38) : 8;
-            setState({ visible: true, x, y, text });
-          }, 10);
+        function evaluate() {
+          const sel = window.getSelection();
+          if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
+            // Selection collapsed/cleared: hide.
+            setState((s) => (s.visible ? { ...s, visible: false } : s));
+            return;
+          }
+          const text = String(sel.toString() || '').trim();
+          if (!text || text.length > 800) return;
+          if (insideOwnUi(sel.anchorNode) || insideOwnUi(sel.focusNode)) {
+            setState((s) => (s.visible ? { ...s, visible: false } : s));
+            return;
+          }
+          let rect = null;
+          try { rect = sel.getRangeAt(0).getBoundingClientRect(); } catch { rect = null; }
+          if (!rect || (rect.width === 0 && rect.height === 0)) return;
+          // Prefer to sit right beside the app's own floating selection pill
+          // ("引用文本" surface, element [data-text-interaction-surface]) so the
+          // two actions read as one cluster. That surface is positioned by the
+          // chat view near the selection; we anchor to its top-right corner.
+          let x, y;
+          let native = null;
+          try { native = document.querySelector('[data-text-interaction-surface]'); } catch { native = null; }
+          let nativeVisible = false;
+          if (native) {
+            const cs = window.getComputedStyle ? window.getComputedStyle(native) : null;
+            const nr = native.getBoundingClientRect();
+            nativeVisible = !native.getAttribute('aria-hidden') ||
+              (cs && cs.visibility !== 'hidden' && cs.display !== 'none' && (nr.width > 0 || nr.height > 0));
+          }
+          if (native && nativeVisible) {
+            const nr = native.getBoundingClientRect();
+            if (nr.width > 0 || nr.height > 0) {
+              // Place immediately to the right of the native pill, same top line.
+              x = Math.min(window.innerWidth - 120, nr.right + 6);
+              y = nr.top;
+            }
+          }
+          if (x === undefined) {
+            const cx = Math.min(window.innerWidth - 140, Math.max(8, rect.left + rect.width / 2 - 52));
+            x = cx;
+            y = Math.max(8, rect.top - 38);
+          }
+          setState({ visible: true, x, y, text });
+        }
+
+        // Primary trigger: `selectionchange` fires reliably on every selection
+        // mutation regardless of whether mouse events reach the document
+        // (the conversation may intercept pointer events). Debounced to let a
+        // drag settle before we read the rect.
+        let tSel = null;
+        let tSel2 = null;
+        function onSelectionChange() {
+          if (tSel) clearTimeout(tSel);
+          if (tSel2) clearTimeout(tSel2);
+          tSel = setTimeout(evaluate, 160);
+          // The native "引用文本" surface is created by an interaction dispatch
+          // that may run a beat later; re-run once so we can snap beside it.
+          tSel2 = setTimeout(evaluate, 360);
+        }
+        // Secondary: mouseup / keyup (keyboard selection via Shift+Arrows).
+        let tUp = null;
+        function onMouseUp() { if (tUp) clearTimeout(tUp); tUp = setTimeout(evaluate, 10); }
+        function onKeyUp(e) {
+          if (e.shiftKey || e.key === 'Shift') { if (tUp) clearTimeout(tUp); tUp = setTimeout(evaluate, 10); }
         }
 
         function onMouseDown(e) {
           const el = e.target;
           if (el && el.closest && el.closest('[data-tm-bubble="1"]')) return;
+          // A new mousedown starts a fresh selection gesture — hide the old bubble.
           setState((s) => (s.visible ? { ...s, visible: false } : s));
         }
         function onHide() { setState((s) => (s.visible ? { ...s, visible: false } : s)); }
         function onKeyDown(e) { if (e.key === 'Escape') onHide(); }
 
+        document.addEventListener('selectionchange', onSelectionChange);
         document.addEventListener('mouseup', onMouseUp, true);
+        document.addEventListener('keyup', onKeyUp, true);
         document.addEventListener('mousedown', onMouseDown, true);
         document.addEventListener('keydown', onKeyDown, true);
         window.addEventListener('scroll', onHide, true);
         window.addEventListener('resize', onHide, true);
         return () => {
+          if (tSel) clearTimeout(tSel);
+          if (tSel2) clearTimeout(tSel2);
+          if (tUp) clearTimeout(tUp);
+          document.removeEventListener('selectionchange', onSelectionChange);
           document.removeEventListener('mouseup', onMouseUp, true);
+          document.removeEventListener('keyup', onKeyUp, true);
           document.removeEventListener('mousedown', onMouseDown, true);
           document.removeEventListener('keydown', onKeyDown, true);
           window.removeEventListener('scroll', onHide, true);
@@ -903,12 +1009,19 @@ window.__ModuleLoader__.load({
       function handleAdd(e) {
         e.preventDefault();
         e.stopPropagation();
-        taskBus.emit(state.text);
+        const titles = parseSelectionToTasks(state.text);
+        if (titles.length) taskBus.emit(titles);
         setState((s) => ({ ...s, visible: false }));
         try { window.getSelection().removeAllRanges(); } catch { /* ignore */ }
       }
 
       if (!state.visible) return null;
+      const count = parseSelectionToTasks(state.text).length;
+      const label = count > 1 ? t('addAsTasksN').replace('{n}', String(count)) : t('addAsTask');
+      // Viewport-anchored (position:fixed) because we align to the native
+      // selection pill via getBoundingClientRect() (viewport coords). The
+      // shell.overlay layer sits inside .frame which has no transform, so a
+      // fixed child is not re-anchored; `.overlayLayer > *` grants pointer events.
       return h('div', {
         'data-tm-ui': '1',
         'data-tm-bubble': '1',
@@ -928,7 +1041,7 @@ window.__ModuleLoader__.load({
           boxShadow: '0 2px 8px rgba(0,0,0,0.25)',
           whiteSpace: 'nowrap',
         },
-      }, `+ ${t('addAsTask')}`));
+      }, `+ ${label}`));
     }
 
     // ---- icon ---------------------------------------------------------------
