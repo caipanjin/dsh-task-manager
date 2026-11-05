@@ -843,7 +843,7 @@ window.__ModuleLoader__.load({
         },
         card: {
           // 510 → 340 (-1/3, so the width itself proves a fresh bundle)
-          width: '340px',
+          width: '400px',
           maxWidth: 'calc(100vw - 40px)',
           maxHeight: 'min(60vh, 520px)',
           display: 'flex',
