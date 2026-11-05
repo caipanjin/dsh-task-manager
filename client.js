@@ -175,14 +175,47 @@ window.__ModuleLoader__.load({
     //    stay one task.
     //  - Leading/trailing blank lines are ignored.
     const LIST_ITEM_RE = /^\s*(?:[-*•·▪◦]|\d+[.)、]|[①-⑳]|\(\d+\))\s*(.+?)\s*$/;
+    // Split a one-line passage that lists items INLINE, e.g.
+    //   "- 甲 / - 乙 / - 丙"   or   "1. 甲、2. 乙、3. 丙"   or   "- 甲 - 乙 - 丙"
+    // Returns [] when it cannot see >=2 such inline items.
+    function splitInlineList(text) {
+      // Only consider an explicit separator between items (/ 、 ， ; ；) or the
+      // very start; bare whitespace is NOT enough, to avoid shredding prose.
+      const re = /(?:^|[/、，;；])\s*(?:[-*•·▪◦]|\d+[.)、]|[①-⑳]|\(\d+\))\s*/g;
+      const marks = [];
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        marks.push({ idx: m.index + m[0].length, markLen: m[0].length });
+        if (m[0].length === 0) re.lastIndex += 1;
+      }
+      if (marks.length < 2) return [];
+      const items = [];
+      for (let i = 0; i < marks.length; i += 1) {
+        const start = marks[i].idx;
+        const end = i + 1 < marks.length ? marks[i + 1].idx - marks[i + 1].markLen : text.length;
+        let seg = text.slice(start, end).trim();
+        seg = seg.replace(/[\s/、，;；]+$/, '').trim();
+        seg = seg.replace(/^[\s/、，;；]+/, '').trim();
+        // Guard: an inline item must be short; a long sentence means this was
+        // prose, not a list — bail out so the whole selection stays one task.
+        if (!seg || seg.length > 60) return [];
+        items.push(seg);
+      }
+      return items.length >= 2 ? items : [];
+    }
     function parseSelectionToTasks(raw) {
       const text = String(raw == null ? '' : raw).replace(/\r\n?/g, '\n').trim();
       if (!text) return [];
       const lines = text.split('\n');
       const markerCount = lines.filter((l) => LIST_ITEM_RE.test(l)).length;
-      // Not a real list (fewer than 2 marked lines) → keep the whole selection
-      // as a single task verbatim.
-      if (markerCount < 2) return [text];
+      // Fallback 1: no per-line list, but the passage has INLINE enumeration such
+      // as "- 甲 / - 乙 / - 丙" or "1. 甲、2. 乙、3. 丙" written on one line.
+      if (markerCount < 2) {
+        const inline = splitInlineList(text);
+        if (inline.length >= 2) return inline;
+        // Not a list at all → keep the whole selection as a single task verbatim.
+        return [text];
+      }
       const items = [];
       let started = false;
       for (const line of lines) {
