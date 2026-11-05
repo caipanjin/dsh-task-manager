@@ -1,7 +1,7 @@
 # Publishing checklist
 
 Repo: https://github.com/caipanjin/dsh-task-manager
-npm:  @caipanjin/dsh-task-manager
+npm:  @caipj/dsh-task-manager
 
 The package is fully prepared (git repo initialised + committed, `npm pack`
 validates cleanly: 9 files, 18 kB). What remains needs **your credentials**
@@ -58,4 +58,4 @@ Copy the title and body from `SUBMISSION.md`.
 - Marketplace scans public repos with the `dsh-plugin` topic on a refresh cycle
   (usually within one cycle). Entry starts as `unconfirmed`, then `verified`.
 - In-app 插件中心 shows it only if the npm package exists (step 3).
-- Install test: `dsh plugin --profile web add @caipanjin/dsh-task-manager`
+- Install test: `dsh plugin --profile web add @caipj/dsh-task-manager`

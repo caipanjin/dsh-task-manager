@@ -34,7 +34,7 @@ marking things done: you decide. Pick a task and hit **Start** to drop
 Published on npm:
 
 ```bash
-dsh plugin --profile web add @caipanjin/dsh-task-manager
+dsh plugin --profile web add @caipj/dsh-task-manager
 ```
 
 Or straight from source:
@@ -86,7 +86,7 @@ bottom-right; click it to expand, drag it to move.
 
 - No network access, no external services, no telemetry.
 - Reads the session projection for tasks; writes only its own `localStorage` keys
-  under `@caipanjin/dsh-task-manager:*`.
+  under `@caipj/dsh-task-manager:*`.
 - Adds one model tool (`task_write`). Nothing else is touched.
 
 ## Known limitations

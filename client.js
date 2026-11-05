@@ -31,12 +31,12 @@
  */
 
 window.__ModuleLoader__.load({
-  id: '@caipanjin/dsh-task-manager',
+  id: '@caipj/dsh-task-manager',
   factory(require) {
     const React = require('react');
     const h = React.createElement;
 
-    const NS = '@caipanjin/dsh-task-manager';
+    const NS = '@caipj/dsh-task-manager';
     const OVERLAY_ID = 'task-manager';
 
     // Fallback strings; overridden by the locale service when available.

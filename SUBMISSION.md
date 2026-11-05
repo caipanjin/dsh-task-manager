@@ -17,7 +17,7 @@
 工具与能力
 
 ### 安装命令
-`dsh plugin --profile web add @caipanjin/dsh-task-manager`
+`dsh plugin --profile web add @caipj/dsh-task-manager`
 
 （源码安装备用：`dsh plugin --profile web add github:caipanjin/dsh-task-manager`）
 
@@ -34,7 +34,7 @@ MIT
 
 ### 补充说明
 - 无网络请求、无外部服务、无遥测
-- 权限：读取任务投影；仅写自己的 localStorage 键（`@caipanjin/dsh-task-manager:*`）；新增一个模型工具 `task_write`
+- 权限：读取任务投影；仅写自己的 localStorage 键（`@caipj/dsh-task-manager:*`）；新增一个模型工具 `task_write`
 - 已知限制：任务"完成确认"状态按会话存于 localStorage，不回写会话日志；用户自建任务在你点"开始"前不进入模型上下文
 - 模型判断任务完成时只"提议完成"，由用户批量确认才生效
 
