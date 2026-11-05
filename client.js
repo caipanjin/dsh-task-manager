@@ -174,7 +174,7 @@ window.__ModuleLoader__.load({
     //    (no marker) are appended to the previous item so multi-line bullets
     //    stay one task.
     //  - Leading/trailing blank lines are ignored.
-    const LIST_ITEM_RE = /^\s*(?:[-*•·▪◦]|\d+[.)、]|[①-⑳]|\(\d+\))\s*(.+?\S)\s*$/;
+    const LIST_ITEM_RE = /^\s*(?:[-*•·▪◦]|\d+[.)、]|[①-⑳]|\(\d+\))\s*(.+?)\s*$/;
     function parseSelectionToTasks(raw) {
       const text = String(raw == null ? '' : raw).replace(/\r\n?/g, '\n').trim();
       if (!text) return [];
@@ -1142,3 +1142,5 @@ window.__ModuleLoader__.load({
     };
   },
 });
+
+
