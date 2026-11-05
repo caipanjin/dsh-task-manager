@@ -74,6 +74,14 @@ window.__ModuleLoader__.load({
       addAsTask: 'Add as task',
       addAsTasksN: 'Add {n} tasks',
       addedAsTask: 'Added to tasks',
+      removeModel: 'Remove',
+      startConfirm: 'Send this task to the conversation and start it?',
+      sendNow: 'Send',
+      cancel: 'Cancel',
+      stTodo: 'To do',
+      stDoing: 'In progress',
+      stDone: 'Done',
+      reopen: 'Reopen',
     };
 
     // Flat dictionaries registered with the locale service (locale/*.json only
@@ -113,15 +121,27 @@ window.__ModuleLoader__.load({
       addAsTask: '添加为任务',
       addAsTasksN: '添加 {n} 个任务',
       addedAsTask: '已加入任务',
+      removeModel: '移除',
+      startConfirm: '要把这个任务发送到对话并开始执行吗？',
+      sendNow: '发送',
+      cancel: '取消',
+      stTodo: '待办',
+      stDoing: '进行中',
+      stDone: '已完成',
+      reopen: '重新打开',
     };
 
     function fill(template, vars) {
       return String(template).replace(/\{(\w+)\}/g, (_, k) => (vars[k] != null ? String(vars[k]) : ''));
     }
 
+    // Three DISTINCT hues so the row never relies on colour alone: neutral for
+    // to-do, amber for in-progress, green for done. `brand-primary` is
+    // deliberately NOT used — it is an inverting neutral (near-black in light,
+    // near-white in dark), which made "in progress" look like a blank/white dot.
     const STATUS_COLOR = {
       todo: 'var(--dsw-alias-state-idle-primary, #8a8f98)',
-      doing: 'var(--dsw-alias-brand-primary, #2f6feb)',
+      doing: 'var(--dsw-alias-state-warn-primary, #f5a524)',
       done: 'var(--dsw-alias-state-success-primary, #2e9e5b)',
     };
 
@@ -329,6 +349,39 @@ window.__ModuleLoader__.load({
       }
     }
 
+    // ---- per-session local overrides for MODEL tasks ------------------------
+    //
+    // The model's tasks live in the host projection, which an installed plugin
+    // cannot rewrite. So the user's own actions on them (mark done, remove) are
+    // recorded here, keyed by model task id: `{[id]: {status?, hidden?}}`. The
+    // projection stays the source of truth for the task text; this map only
+    // overlays the parts the user edited.
+
+    function modelEditKey(sessionId) {
+      return `${NS}:model-edits:${sessionId}`;
+    }
+
+    function loadModelEdits(sessionId) {
+      if (!sessionId) return {};
+      try {
+        const raw = localStorage.getItem(modelEditKey(sessionId));
+        if (!raw) return {};
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === 'object' ? parsed : {};
+      } catch {
+        return {};
+      }
+    }
+
+    function saveModelEdits(sessionId, map) {
+      if (!sessionId) return;
+      try {
+        localStorage.setItem(modelEditKey(sessionId), JSON.stringify(map));
+      } catch {
+        /* ignore quota / privacy mode */
+      }
+    }
+
     // ---- persisted floating-widget position ---------------------------------
 
     function posKey() {
@@ -431,6 +484,8 @@ window.__ModuleLoader__.load({
 
       const [draft, setDraft] = React.useState('');
       const [open, setOpen] = React.useState(false);
+      // Task awaiting the user's "really send this?" confirmation.
+      const [confirmStart, setConfirmStart] = React.useState(null);
 
       // Drag-to-move: null = default anchored position (bottom-right). Once the
       // user drags, we pin an absolute {x,y} (top-left of the widget) instead and
@@ -535,6 +590,26 @@ window.__ModuleLoader__.load({
         commitConfirmations({ ...confirmations, [id]: value });
       }
 
+      // User edits applied to MODEL tasks (the projection itself is read-only
+      // from a plugin): `{status?, hidden?}` per model task id.
+      const [modelEdits, setModelEdits] = React.useState(() => loadModelEdits(sessionId));
+      React.useEffect(() => {
+        setModelEdits(loadModelEdits(sessionId));
+      }, [sessionId]);
+
+      function commitModelEdits(next) {
+        setModelEdits(next);
+        saveModelEdits(sessionId, next);
+      }
+
+      function editModelTask(id, patch) {
+        commitModelEdits({ ...modelEdits, [id]: { ...(modelEdits[id] || {}), ...patch } });
+      }
+
+      function removeModelTask(id) {
+        editModelTask(id, { hidden: true });
+      }
+
       function commitUserTasks(next) {
         setUserTasks(next);
         saveUserTasks(sessionId, next);
@@ -566,8 +641,16 @@ window.__ModuleLoader__.load({
         commitUserTasks(userTasks.filter((task) => task.status !== 'done'));
       }
 
+      // Ask before sending: the user asked for an explicit confirmation step so a
+      // stray click never drops a prompt into the conversation.
+      function requestStart(task) {
+        if (!sessionId) return;
+        setConfirmStart(task);
+      }
+
       function startTask(task) {
         if (!sessionId) return;
+        setConfirmStart(null);
         const sessions = ctx.get('sessions');
         let sent = false;
         try {
@@ -588,11 +671,17 @@ window.__ModuleLoader__.load({
       // For model tasks the model may have proposed completion (`proposedDone`);
       // the row shows "awaiting confirmation" until the user confirms/dismisses it
       // (stored in `confirmations[taskId]`).
-      const modelRows = modelTasks.map((task) => {
-        const decision = confirmations[task.id];
-        const pendingConfirm = task.proposedDone === true && decision !== 'confirmed';
-        return { ...task, _source: 'model', _pendingConfirm: pendingConfirm };
-      });
+      const modelRows = modelTasks
+        .filter((task) => !(modelEdits[task.id] && modelEdits[task.id].hidden))
+        .map((task) => {
+          const decision = confirmations[task.id];
+          const pendingConfirm = task.proposedDone === true && decision !== 'confirmed';
+          const edit = modelEdits[task.id] || {};
+          // A local status edit wins over the projection's status so a user's
+          // "done" click is visible even though the host record is unchanged.
+          const status = edit.status || task.status;
+          return { ...task, status, _source: 'model', _pendingConfirm: pendingConfirm };
+        });
       const merged = [
         ...modelRows,
         ...userTasks.map((task) => ({ ...task, _source: 'user', _pendingConfirm: false })),
@@ -624,40 +713,52 @@ window.__ModuleLoader__.load({
         commitConfirmations(next);
       }
 
+      // Advance a task's status. For MODEL tasks the projection cannot be
+      // rewritten, so the change is recorded in `modelEdits` (and a "done" also
+      // records the user's confirmation of the model's own completion proposal).
+      // The row's single status control. It always shows TEXT ("mark in
+      // progress" / "complete" / "reopen") so the state never has to be guessed
+      // from a colour, and a done task offers "reopen" instead of a second
+      // "complete" that would do nothing.
       function statusButton(task) {
         const isUser = task._source === 'user';
-        const advance = () => {
-          const next = task.status === 'todo' ? 'doing' : task.status === 'doing' ? 'done' : 'todo';
+        const apply = (next) => {
           if (isUser) {
             setUserStatus(task.id, next);
-          } else if (next === 'done') {
-            // Model task: mark done locally (overrides the projection display).
-            setConfirmation(task.id, 'confirmed');
           } else {
-            // Non-done transitions for model tasks are handed back to the model.
-            startTask(task);
+            // Model tasks live in the host projection (read-only here), so the
+            // user's edit is recorded locally; "done" also confirms the model's
+            // own completion proposal so the pending banner clears.
+            editModelTask(task.id, { status: next });
+            if (next === 'done') setConfirmation(task.id, 'confirmed');
+            else setConfirmation(task.id, 'dismissed');
           }
         };
-        const label = task.status === 'todo' ? t('markDoing') : task.status === 'doing' ? t('markDone') : t('markTodo');
-        const glyph = task.status === 'todo' ? '▶' : task.status === 'doing' ? '✓' : '↺';
+        if (task.status === 'done') {
+          return h('button', {
+            style: styles.btn, title: t('reopen'), 'aria-label': t('reopen'),
+            onClick: () => apply('todo'),
+          }, t('reopen'));
+        }
+        if (task.status === 'doing') {
+          return h('button', {
+            style: styles.btn, title: t('markDone'), 'aria-label': t('markDone'),
+            onClick: () => apply('done'),
+          }, `✓ ${t('complete')}`);
+        }
         return h('button', {
-          style: styles.btn, title: label, 'aria-label': label,
-          onClick: advance,
-        }, glyph);
+          style: styles.btn, title: t('markDoing'), 'aria-label': t('markDoing'),
+          onClick: () => apply('doing'),
+        }, t('markDoing'));
       }
 
-      // A row's explicit "Complete" button — the missing entry point the user
-      // asked for. Works for both user and model tasks (model → local confirm).
-      function completeButton(task) {
-        if (task.status === 'done' && !task._pendingConfirm) return null;
-        const done = () => {
-          if (task._source === 'user') setUserStatus(task.id, 'done');
-          else setConfirmation(task.id, 'confirmed');
-        };
-        return h('button', {
-          style: styles.btn, title: t('complete'), 'aria-label': t('complete'),
-          onClick: done,
-        }, `✓ ${t('complete')}`);
+      // Visible state chip: text, not colour, is the primary signal.
+      function statusChip(task) {
+        const label = task.status === 'done' ? t('stDone') : task.status === 'doing' ? t('stDoing') : t('stTodo');
+        return h('span', {
+          style: { ...styles.statusChip, color: STATUS_COLOR[task.status] || STATUS_COLOR.todo },
+          title: label,
+        }, label);
       }
 
       const rows = merged.map((task) => {
@@ -680,6 +781,7 @@ window.__ModuleLoader__.load({
               ? h('span', { style: styles.labelDetail }, task.detail)
               : null,
           ),
+          statusChip(task),
           pending
             ? h('span', { style: styles.pendingBadge, title: t('proposed') }, t('proposed'))
             : null,
@@ -687,11 +789,18 @@ window.__ModuleLoader__.load({
             ? h('button', {
                 style: styles.primaryBtn, title: t('confirm'), onClick: () => setConfirmation(task.id, 'confirmed'),
               }, t('confirm'))
-            : completeButton(task),
-          h('button', { style: styles.btn, onClick: () => startTask(task), title: t('start') }, t('start')),
-          isUser
-            ? h('button', { style: styles.btn, onClick: () => removeUserTask(task.id), title: t('remove') }, '✕')
             : null,
+          statusButton(task),
+          // "Start" only makes sense while the task is still to-do/in progress;
+          // a done task has nothing left to send.
+          task.status === 'done'
+            ? null
+            : h('button', { style: styles.btn, onClick: () => requestStart(task), title: t('start') }, t('start')),
+          h('button', {
+            style: styles.btn,
+            onClick: () => (isUser ? removeUserTask(task.id) : removeModelTask(task.id)),
+            title: isUser ? t('remove') : t('removeModel'),
+          }, '✕'),
         );
       });
 
@@ -755,6 +864,22 @@ window.__ModuleLoader__.load({
             sessionId === undefined
               ? h('div', { style: styles.empty }, t('noSession'))
               : h('div', { style: styles.bodyInner },
+                confirmStart
+                  ? h('div', { style: styles.startBar },
+                      h('span', { style: styles.confirmText },
+                        `${t('startConfirm')} “${confirmStart.title}”`),
+                      h('button', {
+                        style: styles.primaryBtn,
+                        onClick: () => startTask(confirmStart),
+                        title: t('sendNow'),
+                      }, t('sendNow')),
+                      h('button', {
+                        style: styles.btn,
+                        onClick: () => setConfirmStart(null),
+                        title: t('cancel'),
+                      }, t('cancel')),
+                    )
+                  : null,
                 pendingCount > 0
                   ? h('div', { style: styles.confirmBar },
                       h('span', { style: styles.confirmText },
@@ -877,6 +1002,19 @@ window.__ModuleLoader__.load({
           backgroundColor: 'color-mix(in srgb, var(--dsw-alias-state-success-primary) 14%, transparent)',
         },
         confirmText: { flex: '1 1 auto', minWidth: 0, fontSize: '12px', color: C.text },
+        // "Really send this task?" bar — accent-tinted so it reads as an
+        // affirmative prompt rather than another status banner.
+        startBar: {
+          display: 'flex',
+          alignItems: 'center',
+          gap: '6px',
+          flexWrap: 'wrap',
+          padding: '7px 9px',
+          borderRadius: '8px',
+          border: `1px solid ${C.accent}`,
+          background: C.surface2,
+          backgroundColor: 'color-mix(in srgb, var(--dsw-alias-brand-primary) 12%, transparent)',
+        },
         pendingBadge: {
           flex: '0 0 auto',
           fontSize: '10px',
@@ -932,6 +1070,14 @@ window.__ModuleLoader__.load({
           background: C.surface2,
         },
         dot: { width: '9px', height: '9px', borderRadius: '50%', flex: '0 0 auto' },
+        // Text state chip: colour reinforces, but the WORD carries the state.
+        statusChip: {
+          flex: '0 0 auto',
+          fontSize: '10px',
+          lineHeight: '15px',
+          fontWeight: 600,
+          whiteSpace: 'nowrap',
+        },
         badge: {
           flex: '0 0 auto',
           fontSize: '10px',
