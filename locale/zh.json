@@ -1,0 +1,24 @@
+{
+  "meta": {
+    "title": "任务管理",
+    "description": "管理模型建议的任务或你自己添加的任务，并可选择任务发送到对话框让模型开始执行。"
+  },
+  "panel": {
+    "title": "任务",
+    "empty": "还没有任务。可以让模型给出实施顺序，或在下方添加。",
+    "addPlaceholder": "添加任务…",
+    "add": "添加",
+    "send": "发送到对话框",
+    "remove": "删除",
+    "markDone": "标记完成",
+    "markTodo": "标记待办",
+    "markDoing": "标记进行中",
+    "sendPrompt": "开始执行这个任务：{title}",
+    "countPending": "{n} 项待办",
+    "countDoing": "{n} 项进行中",
+    "countDone": "{n} 项已完成",
+    "fromModel": "模型建议",
+    "fromUser": "手动添加",
+    "sendAdded": "已将“{title}”发送到对话框。"
+  }
+}

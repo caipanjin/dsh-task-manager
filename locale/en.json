@@ -1,0 +1,24 @@
+{
+  "meta": {
+    "title": "Task manager",
+    "description": "Track tasks proposed by the model or added by you, and send a task to the conversation to begin."
+  },
+  "panel": {
+    "title": "Tasks",
+    "empty": "No tasks yet. Ask the model for a plan, or add one below.",
+    "addPlaceholder": "Add a task…",
+    "add": "Add",
+    "send": "Send to chat",
+    "remove": "Remove",
+    "markDone": "Mark done",
+    "markTodo": "Mark to do",
+    "markDoing": "Mark in progress",
+    "sendPrompt": "Start this task: {title}",
+    "countPending": "{n} to do",
+    "countDoing": "{n} in progress",
+    "countDone": "{n} done",
+    "fromModel": "From model",
+    "fromUser": "Added",
+    "sendAdded": "Sent “{title}” to the conversation."
+  }
+}

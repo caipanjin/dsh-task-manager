@@ -1,0 +1,11 @@
+# dependencies
+node_modules/
+
+# OS / editor
+.DS_Store
+*.log
+
+# transient screenshots / test artifacts (keep docs/ screenshots)
+/*.png
+/*.webp
+/.build-mcache/
