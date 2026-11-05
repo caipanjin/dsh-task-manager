@@ -958,33 +958,23 @@ window.__ModuleLoader__.load({
           let rect = null;
           try { rect = sel.getRangeAt(0).getBoundingClientRect(); } catch { rect = null; }
           if (!rect || (rect.width === 0 && rect.height === 0)) return;
-          // Prefer to sit right beside the app's own floating selection pill
-          // ("引用文本" surface, element [data-text-interaction-surface]) so the
-          // two actions read as one cluster. That surface is positioned by the
-          // chat view near the selection; we anchor to its top-right corner.
-          let x, y;
-          let native = null;
-          try { native = document.querySelector('[data-text-interaction-surface]'); } catch { native = null; }
-          let nativeVisible = false;
-          if (native) {
-            const cs = window.getComputedStyle ? window.getComputedStyle(native) : null;
-            const nr = native.getBoundingClientRect();
-            nativeVisible = !native.getAttribute('aria-hidden') ||
-              (cs && cs.visibility !== 'hidden' && cs.display !== 'none' && (nr.width > 0 || nr.height > 0));
+          // Anchor to the SELECTION itself, not to the app's native pill.
+          // The native pill (引用文本 / 添加到对话 / 旁问) floats near the top-left
+          // of the selection; putting our button at the selection's bottom-right
+          // keeps the two clusters apart instead of overlapping them. We never
+          // read the native surface's rect: while it is hidden its rect is zero
+          // or stale, which previously parked our button underneath it.
+          const MARGIN = 8;
+          const bubbleW = 130;
+          const bubbleH = 30;
+          let x = Math.min(window.innerWidth - bubbleW - MARGIN, rect.right + MARGIN);
+          let y = rect.bottom + MARGIN;
+          // No room below → flip above the selection's first line.
+          if (y + bubbleH > window.innerHeight - MARGIN) {
+            y = Math.max(MARGIN, rect.top - bubbleH - MARGIN);
           }
-          if (native && nativeVisible) {
-            const nr = native.getBoundingClientRect();
-            if (nr.width > 0 || nr.height > 0) {
-              // Place immediately to the right of the native pill, same top line.
-              x = Math.min(window.innerWidth - 120, nr.right + 6);
-              y = nr.top;
-            }
-          }
-          if (x === undefined) {
-            const cx = Math.min(window.innerWidth - 140, Math.max(8, rect.left + rect.width / 2 - 52));
-            x = cx;
-            y = Math.max(8, rect.top - 38);
-          }
+          x = Math.max(MARGIN, x);
+          y = Math.max(MARGIN, y);
           setState({ visible: true, x, y, text });
         }
 
