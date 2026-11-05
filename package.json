@@ -1,6 +1,6 @@
 {
   "name": "@caipj/dsh-task-manager",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": false,
   "type": "module",
   "description": "Task manager for the DeepSeek Harness chat: tasks proposed by the model or added by the user, shown in a draggable floating panel, with origin badges and a confirm-before-done flow — click a task to hand it to the model.",
@@ -40,14 +40,20 @@
     "locale/*.json",
     "icon.svg",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "docs/*.png"
   ],
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "immediately": true,
-      "inject": ["@deepseek-ai/dsh-client-ui-conversation", "@deepseek-ai/dsh-client-ui-session"]
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-session"
+      ]
     }
   }
 }
