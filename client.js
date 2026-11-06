@@ -48,7 +48,6 @@ window.__ModuleLoader__.load({
       start: 'Start',
       remove: 'Remove',
       markDone: 'Mark done',
-      markTodo: 'Mark to do',
       markDoing: 'Mark in progress',
       sendPrompt: 'Start this task: {title}',
       countPending: '{n} to do',
@@ -61,7 +60,6 @@ window.__ModuleLoader__.load({
       noSession: 'Open a conversation to use the task panel.',
       clearDone: 'Clear done',
       openPanel: 'Show tasks',
-      closePanel: 'Hide tasks',
       collapse: 'Collapse',
       dragHint: 'Drag to move',
       complete: 'Complete',
@@ -70,10 +68,8 @@ window.__ModuleLoader__.load({
       confirmAll: 'Confirm all',
       confirm: 'Confirm',
       dismiss: 'Dismiss',
-      confirmDismissed: 'Dismissed',
       addAsTask: 'Add as task',
       addAsTasksN: 'Add {n} tasks',
-      addedAsTask: 'Added to tasks',
       removeModel: 'Remove',
       startConfirm: 'Send this task to the conversation and start it?',
       sendNow: 'Send',
@@ -95,7 +91,6 @@ window.__ModuleLoader__.load({
       start: '开始',
       remove: '删除',
       markDone: '标记完成',
-      markTodo: '标记待办',
       markDoing: '标记进行中',
       sendPrompt: '开始执行这个任务：{title}',
       countPending: '{n} 项待办',
@@ -108,7 +103,6 @@ window.__ModuleLoader__.load({
       noSession: '打开一个对话即可使用任务面板。',
       clearDone: '清除已完成',
       openPanel: '显示任务',
-      closePanel: '隐藏任务',
       collapse: '收起',
       dragHint: '拖动移动位置',
       complete: '完成',
@@ -117,10 +111,8 @@ window.__ModuleLoader__.load({
       confirmAll: '全部确认',
       confirm: '确认',
       dismiss: '忽略',
-      confirmDismissed: '已忽略',
       addAsTask: '添加为任务',
       addAsTasksN: '添加 {n} 个任务',
-      addedAsTask: '已加入任务',
       removeModel: '移除',
       startConfirm: '要把这个任务发送到对话并开始执行吗？',
       sendNow: '发送',
@@ -394,7 +386,15 @@ window.__ModuleLoader__.load({
         if (!raw) return null;
         const parsed = JSON.parse(raw);
         if (parsed && typeof parsed.x === 'number' && typeof parsed.y === 'number') {
-          return { x: parsed.x, y: parsed.y };
+          // Clamp to the CURRENT window: a position saved on a large display would
+          // otherwise reopen off-screen on a smaller one, leaving the card
+          // unreachable with no way to drag it back.
+          const maxX = Math.max(0, (window.innerWidth || 0) - 120);
+          const maxY = Math.max(0, (window.innerHeight || 0) - 60);
+          return {
+            x: Math.min(maxX, Math.max(0, parsed.x)),
+            y: Math.min(maxY, Math.max(0, parsed.y)),
+          };
         }
         return null;
       } catch {
@@ -491,10 +491,6 @@ window.__ModuleLoader__.load({
       // user drags, we pin an absolute {x,y} (top-left of the widget) instead and
       // persist it so the panel stays where they dropped it across remounts.
       const [pos, setPos] = React.useState(() => loadWidgetPos());
-      React.useEffect(() => {
-        // Reset persisted position per session is not needed; keep it global to
-        // the widget (one floating panel per window).
-      }, []);
 
       // Drag state machine. `dragRef` holds transient values that must not
       // trigger re-renders each mousemove.
@@ -589,6 +585,40 @@ window.__ModuleLoader__.load({
       function setConfirmation(id, value) {
         commitConfirmations({ ...confirmations, [id]: value });
       }
+
+      // A completion proposal must be answered PER PROPOSAL, not once per task
+      // forever. `startTask` records a dismissal for model tasks (so the card
+      // does not nag right after the user sends one off), and a dismissal also
+      // means "the model was wrong, it is not done" — either way that stored
+      // answer would silently swallow any LATER genuine `propose_done` on the
+      // same id. So track which ids the projection currently marks proposed,
+      // and drop the stored answer when an id NEWLY (re)appears there.
+      const proposedNow = modelTasks
+        .filter((task) => task.proposedDone === true)
+        .map((task) => task.id)
+        .join(',');
+      const proposedSeenRef = React.useRef({ sessionId: undefined, ids: new Set() });
+      React.useEffect(() => {
+        const ids = new Set(proposedNow ? proposedNow.split(',') : []);
+        // The first run for a session only records a baseline: a page reload — or
+        // switching to another session — must NOT wipe answers the user already
+        // gave to proposals that were on screen there.
+        if (proposedSeenRef.current.sessionId !== sessionId) {
+          proposedSeenRef.current = { sessionId, ids };
+          return;
+        }
+        const previous = proposedSeenRef.current.ids || new Set();
+        const fresh = [...ids].filter((id) => !previous.has(id));
+        proposedSeenRef.current = { sessionId, ids };
+        if (!fresh.length) return;
+        const stored = loadConfirmations(sessionId);
+        const stale = fresh.filter((id) => stored[id] !== undefined);
+        if (!stale.length) return;
+        const next = { ...stored };
+        for (const id of stale) delete next[id];
+        saveConfirmations(sessionId, next);
+        setConfirmations(next);
+      }, [sessionId, proposedNow]);
 
       // User edits applied to MODEL tasks (the projection itself is read-only
       // from a plugin): `{status?, hidden?}` per model task id.
@@ -707,11 +737,23 @@ window.__ModuleLoader__.load({
         .filter((task) => !(modelEdits[task.id] && modelEdits[task.id].hidden))
         .map((task) => {
           const decision = confirmations[task.id];
-          const pendingConfirm = task.proposedDone === true && decision !== 'confirmed';
+          // A proposal is PENDING only until the user answers it. BOTH 'confirmed'
+          // and 'dismissed' are answers. Before this fix `decision !== 'confirmed'`
+          // left a dismissed proposal showing the "awaiting confirm" badge forever
+          // (while the banner was already gone), so the row looked stuck.
+          const pendingConfirm = task.proposedDone === true && decision === undefined;
           const edit = modelEdits[task.id] || {};
           // A local status edit wins over the projection's status so a user's
           // "done" click is visible even though the host record is unchanged.
-          const status = edit.status || task.status;
+          // A DISMISSED proposal means "the model is wrong, it is not done", so the
+          // row falls back to to-do instead of pretending to be finished.
+          // Precedence: an ACCEPTED proposal means the task is done (even if the
+          // user had marked it "in progress" before the model reported it); then
+          // the user's own local edit; then a rejected proposal falls back to
+          // to-do; otherwise the projection's own status.
+          const status = decision === 'confirmed'
+            ? 'done'
+            : edit.status || (decision === 'dismissed' ? 'todo' : task.status);
           return { ...task, status, _source: 'model', _pendingConfirm: pendingConfirm };
         });
       const merged = [
@@ -720,7 +762,7 @@ window.__ModuleLoader__.load({
       ];
 
       // Tasks the model proposed as done that the user has not yet confirmed.
-      const pendingConfirms = merged.filter((task) => task._pendingConfirm && confirmations[task.id] !== 'dismissed');
+      const pendingConfirms = merged.filter((task) => task._pendingConfirm);
 
       // Count done only for confirmed/completed tasks; pending ones are surfaced
       // in the confirm banner rather than counted as finished.
@@ -929,7 +971,15 @@ window.__ModuleLoader__.load({
                     value: draft,
                     placeholder: t('addPlaceholder'),
                     onChange: (e) => setDraft(e.target.value),
-                    onKeyDown: (e) => { if (e.key === 'Enter') { e.preventDefault(); addTask(); } },
+                    onKeyDown: (e) => {
+                      // Ignore Enter while an IME is composing: with Chinese
+                      // input, the Enter that commits a candidate would otherwise
+                      // add the half-typed pinyin as a task. keyCode 229 is the
+                      // legacy signal browsers still emit mid-composition.
+                      if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return;
+                      e.preventDefault();
+                      addTask();
+                    },
                   }),
                   h('button', { style: styles.primaryBtn, onClick: addTask }, t('add')),
                 ),
@@ -1174,14 +1224,24 @@ window.__ModuleLoader__.load({
             return;
           }
           const text = String(sel.toString() || '').trim();
-          if (!text || text.length > 800) return;
+          if (!text || text.length > 800) {
+            // Too long (or empty): HIDE, do not just bail out. A bare `return`
+            // left a previously shown bubble floating over an old position, so
+            // clicking it would add the OLD text instead of the current selection.
+            setState((s) => (s.visible ? { ...s, visible: false } : s));
+            return;
+          }
           if (insideOwnUi(sel.anchorNode) || insideOwnUi(sel.focusNode)) {
             setState((s) => (s.visible ? { ...s, visible: false } : s));
             return;
           }
           let rect = null;
           try { rect = sel.getRangeAt(0).getBoundingClientRect(); } catch { rect = null; }
-          if (!rect || (rect.width === 0 && rect.height === 0)) return;
+          if (!rect || (rect.width === 0 && rect.height === 0)) {
+            // No usable geometry: hide for the same reason as above.
+            setState((s) => (s.visible ? { ...s, visible: false } : s));
+            return;
+          }
           // Anchor to the SELECTION itself, not to the app's native pill.
           // The native pill (引用文本 / 添加到对话 / 旁问) floats near the top-left
           // of the selection; putting our button at the selection's bottom-right
@@ -1282,7 +1342,7 @@ window.__ModuleLoader__.load({
         type: 'button',
         onMouseDown: (e) => e.preventDefault(),
         onClick: handleAdd,
-        title: t('addAsTask'),
+        title: label,
         style: {
           display: 'inline-flex', alignItems: 'center', gap: '4px',
           padding: '4px 10px', fontSize: '12px', lineHeight: '18px',
