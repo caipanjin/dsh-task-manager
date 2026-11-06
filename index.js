@@ -199,11 +199,26 @@ function applyAction(action, args, current) {
       return tasks;
     }
     case 'replace': {
-      if (action === 'replace' && !Array.isArray(args.tasks)) throw new Error('`tasks` must be an array');
+      if (!Array.isArray(args.tasks)) throw new Error('`tasks` must be an array');
+      // Reuse the id of an existing task whose title matches the incoming one.
+      // The tool description actively recommends `replace` for ordered plans, so
+      // a rewrite happens often; minting a fresh id every time silently dropped
+      // all per-task state the Client keeps by id (hidden / status edit /
+      // completion confirmation), because the Client can only store its answers
+      // locally and they are keyed on the id.
+      const available = tasks.slice();
       const seen = new Set();
       const out = [];
       for (const raw of args.tasks) {
         const task = normalizeTask(raw);
+        if (typeof raw.id !== 'string' || raw.id.length === 0) {
+          const folded = foldTitle(task.title);
+          const at = available.findIndex((candidate) => foldTitle(candidate.title) === folded);
+          if (at >= 0) {
+            task.id = available[at].id;
+            available.splice(at, 1);
+          }
+        }
         if (seen.has(task.id)) task.id = mintId();
         seen.add(task.id);
         out.push(task);
