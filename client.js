@@ -637,8 +637,29 @@ window.__ModuleLoader__.load({
         commitUserTasks(userTasks.map((task) => (task.id === id ? { ...task, status } : task)));
       }
 
-      function clearDoneUserTasks() {
-        commitUserTasks(userTasks.filter((task) => task.status !== 'done'));
+      // "Clear done" must cover BOTH sources: user tasks live in `userTasks`,
+      // model tasks live in the read-only projection so they can only be hidden
+      // locally (same mechanism as the per-row ✕). Tasks still awaiting the
+      // user's completion confirmation are left alone — they are surfaced in the
+      // confirm banner and must not vanish before the user answers it.
+      function clearDoneTasks() {
+        const doneUserId = new Set();
+        const nextModelEdits = { ...modelEdits };
+        let modelChanged = false;
+        for (const task of merged) {
+          if (task._pendingConfirm) continue;
+          if (task.status !== 'done') continue;
+          if (task._source === 'user') {
+            doneUserId.add(task.id);
+          } else {
+            nextModelEdits[task.id] = { ...(nextModelEdits[task.id] || {}), hidden: true };
+            modelChanged = true;
+          }
+        }
+        if (doneUserId.size > 0) {
+          commitUserTasks(userTasks.filter((task) => !doneUserId.has(task.id)));
+        }
+        if (modelChanged) commitModelEdits(nextModelEdits);
       }
 
       // Ask before sending: the user asked for an explicit confirmation step so a
@@ -662,6 +683,17 @@ window.__ModuleLoader__.load({
           }
         } catch {
           sent = false;
+        }
+        // A task that was just handed to the model is by definition in progress;
+        // reflect that immediately instead of leaving it sitting in "to do" until
+        // the user clicks the status button. Never downgrade an already-done task.
+        if (sent && task.status !== 'doing' && task.status !== 'done') {
+          if (task._source === 'user') {
+            setUserStatus(task.id, 'doing');
+          } else {
+            editModelTask(task.id, { status: 'doing' });
+            setConfirmation(task.id, 'dismissed');
+          }
         }
         // Collapse the floating card so the conversation is unobstructed.
         if (sent) setOpen(false);
@@ -851,7 +883,7 @@ window.__ModuleLoader__.load({
             h('span', { style: styles.title }, t('title')),
             h('span', { style: styles.counts }, countsText),
             counts.done > 0
-              ? h('button', { style: styles.btn, onClick: clearDoneUserTasks, title: t('clearDone') }, t('clearDone'))
+              ? h('button', { style: styles.btn, onClick: clearDoneTasks, title: t('clearDone') }, t('clearDone'))
               : null,
             h('button', {
               style: styles.closeBtn,
