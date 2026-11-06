@@ -59,6 +59,49 @@ function normalizeTask(raw) {
   return task;
 }
 
+/** Case- and width-insensitive, punctuation-free form used for title matching. */
+function foldTitle(text) {
+  return String(text)
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[\s\u3000]+/g, '')
+    .replace(/[!-/:-@[-`{-~，。、；：？！“”‘’（）《》【】…—－]/g, '');
+}
+
+/**
+ * Resolve one requested task reference to exactly one task.
+ *
+ * A reference is normally a task id. Models routinely forget ids, so a title is
+ * also accepted when it identifies exactly one task: an exact (whitespace- and
+ * punctuation-insensitive) title match wins, otherwise a single unique prefix
+ * match wins. Ambiguity is an error rather than a guess, because silently
+ * marking the wrong task done is worse than asking the model to disambiguate.
+ */
+function resolveTask(tasks, ref) {
+  const byId = tasks.find((task) => task.id === ref);
+  if (byId !== undefined) return byId;
+
+  const needle = foldTitle(ref);
+  if (needle.length === 0) throw new Error(`no task with id ${JSON.stringify(ref)}`);
+  const exact = tasks.filter((task) => foldTitle(task.title) === needle);
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1) {
+    throw new Error(
+      `title ${JSON.stringify(ref)} matches ${exact.length} tasks (${exact.map((t) => t.id).join(', ')}); pass \`ids\` instead`,
+    );
+  }
+  const prefix = tasks.filter((task) => foldTitle(task.title).startsWith(needle));
+  if (prefix.length === 1) return prefix[0];
+  if (prefix.length > 1) {
+    throw new Error(
+      `title ${JSON.stringify(ref)} is ambiguous: ${prefix
+        .map((t) => `${t.title} (${t.id})`)
+        .join(', ')}; pass the exact id or a longer title`,
+    );
+  }
+  throw new Error(`no task matching id or title ${JSON.stringify(ref)}`);
+}
+
 /** Serialize the task list into the marker line the projection folds. */
 function encodeState(tasks) {
   return `${MARKER}${JSON.stringify({ tasks })}`;
@@ -141,9 +184,8 @@ function applyAction(action, args, current) {
       else if (typeof args.id === 'string' && args.id.length > 0) ids = [args.id];
       else throw new Error('propose_done needs `ids` (array) or `id`');
       const found = [];
-      for (const id of ids) {
-        const task = tasks.find((candidate) => candidate.id === id);
-        if (task === undefined) throw new Error(`no task with id ${JSON.stringify(id)}`);
+      for (const ref of ids) {
+        const task = resolveTask(tasks, ref);
         task.status = 'done';
         task.proposedDone = true;
         found.push(task);
@@ -216,21 +258,21 @@ async function apply(ctx) {
   ctx.tools.register(defineTool({
     name: 'task_write',
     description:
-      'Maintain this session\'s task list, shown in a floating task card in the bottom-right corner of the window (collapsed to a pill by default; click to expand — it stays on top of the conversation). IMPORTANT: whenever you lay out an ordered implementation plan or a multi-step set of next actions for the user (e.g. "1. do X, 2. do Y, 3. do Z"), ALSO record those steps as tasks here — use action "replace" with the full ordered list, or one "add" per step — so the user sees and can start them from the card instead of having to copy text manually. Also use it to add follow-up tasks and to report progress. To report that a task (or several) is COMPLETE, prefer action "propose_done" (pass `ids`): this marks the tasks done but AWAITING the user\'s confirmation, which the card surfaces as a bulk confirm prompt — do NOT use set_status done for completion unless the user explicitly told you they are done. Use action "set_status" only to move a task to todo/doing or to apply a status the user explicitly requested. Task fields: id, title, status (todo|doing|done), origin (model|user). The tool returns the complete updated list; ids are stable and are how you later update or remove a task.',
+      'Maintain this session\'s task list, shown in a floating task card in the bottom-right corner of the window (collapsed to a pill by default; click to expand — it stays on top of the conversation). IMPORTANT: whenever you lay out an ordered implementation plan or a multi-step set of next actions for the user (e.g. "1. do X, 2. do Y, 3. do Z"), ALSO record those steps as tasks here — use action "replace" with the full ordered list, or one "add" per step — so the user sees and can start them from the card instead of having to copy text manually. Also use it to add follow-up tasks and to report progress. To report that a task (or several) is COMPLETE, prefer action "propose_done" (pass `ids`): this marks the tasks done but AWAITING the user\'s confirmation, which the card surfaces as a bulk confirm prompt — do NOT use set_status done for completion unless the user explicitly told you they are done. `ids` entries may be task ids OR titles that uniquely identify a task, so you do not need to re-`list` just to recover an id. Use action "set_status" only to move a task to todo/doing or to apply a status the user explicitly requested. Task fields: id, title, status (todo|doing|done), origin (model|user). The tool returns the complete updated list; ids are stable and are how you later update or remove a task.',
     parameters: {
       action: {
         type: 'string',
         required: true,
         enum: ['add', 'set_status', 'propose_done', 'remove', 'replace', 'clear', 'list'],
-        description: 'add: append one task; set_status: change one task status by id; propose_done: mark one or more tasks DONE pending the user\'s confirmation (use this to report completion); remove: delete by id; replace: set the whole list (use for an ordered plan); clear: empty the list; list: read without changing.',
+        description: 'add: append one task; set_status: change one task status by id; propose_done: mark one or more tasks DONE pending the user\'s confirmation (use this to report completion; accepts ids or unique titles); remove: delete by id; replace: set the whole list (use for an ordered plan); clear: empty the list; list: read without changing.',
       },
       title: { type: 'string', description: 'For action "add": the task title.' },
       detail: { type: 'string', description: 'For action "add": optional one-line detail.' },
       status: { type: 'string', enum: STATUSES, description: 'For "add" (default todo) or "set_status": the target status.' },
-      id: { type: 'string', description: 'For "set_status" / "remove" / single-target "propose_done": the task id.' },
+      id: { type: 'string', description: 'For "set_status" / "remove" / single-target "propose_done": the task id (propose_done also accepts a title that uniquely identifies one task).' },
       ids: {
         type: 'array',
-        description: 'For action "propose_done": the task ids to mark done pending confirmation (batch).',
+        description: 'For action "propose_done": the tasks to mark done pending confirmation (batch). Each entry is a task id, or a title — a title must identify exactly one task (exact match, or a unique prefix, ignoring case/whitespace/punctuation); ambiguous titles are rejected. Use "list" first if unsure.',
         items: { type: 'string' },
       },
       position: { type: 'integer', description: 'For "add": 1-based insertion index; omit to append.' },
