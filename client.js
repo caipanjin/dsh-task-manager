@@ -452,9 +452,23 @@ window.__ModuleLoader__.load({
 
     // ---- floating task widget ----------------------------------------------
 
+    // `usePanelInfo` exposes the frame's main-panel key: `null` means the
+    // ordinary conversation page, any other id means a GLOBAL page (the plugin
+    // manager, settings, the marketplace …). The task card belongs to a
+    // conversation, so it must hide on those pages instead of floating over
+    // them. Read it through one helper so both overlay entries agree, and fall
+    // back to "conversation" when the prop is absent (older frame builds) so the
+    // card never disappears entirely.
+    function useOnConversationPage(usePanelInfo) {
+      const select = typeof usePanelInfo === 'function' ? usePanelInfo : null;
+      if (!select) return true;
+      return select((info) => (info && info.activePanelId !== undefined ? info.activePanelId === null : true));
+    }
+
     function TaskWidget(props) {
-      const { ctx, useSessions, t } = props;
+      const { ctx, useSessions, usePanelInfo, t } = props;
       const sessionId = useActiveSessionId(useSessions);
+      const onConversation = useOnConversationPage(usePanelInfo);
 
       const modelTasks = useModelTasks(ctx, sessionId);
 
@@ -889,6 +903,11 @@ window.__ModuleLoader__.load({
         ? { ...styles.wrap, left: `${pos.x}px`, top: `${pos.y}px`, right: 'auto', bottom: 'auto' }
         : styles.wrap;
 
+      // A global page (plugin manager, settings, marketplace …) is not a
+      // conversation: hide the card entirely there. Placed after every hook so
+      // hook order stays stable across the two page kinds.
+      if (!onConversation) return null;
+
       // ---- collapsed pill ----------------------------------------------------
       if (!open) {
         return h('div', { style: wrapStyle, 'data-task-manager': '', 'data-tm-ui': '1' },
@@ -1203,7 +1222,8 @@ window.__ModuleLoader__.load({
     // the task bus (added as a user task). We only react to non-empty selections
     // of reasonable length, and ignore selections made inside our own card.
     function SelectionBubble(props) {
-      const { t } = props;
+      const { t, usePanelInfo } = props;
+      const onConversation = useOnConversationPage(usePanelInfo);
       const [state, setState] = React.useState({ visible: false, x: 0, y: 0, text: '', titles: [] });
 
       React.useEffect(() => {
@@ -1326,7 +1346,7 @@ window.__ModuleLoader__.load({
         try { window.getSelection().removeAllRanges(); } catch { /* ignore */ }
       }
 
-      if (!state.visible) return null;
+      if (!state.visible || !onConversation) return null;
       const titles = state.titles && state.titles.length ? state.titles : parseSelectionToTasks(state.text);
       const count = titles.length;
       const label = count > 1 ? t('addAsTasksN').replace('{n}', String(count)) : t('addAsTask');
