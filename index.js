@@ -17,15 +17,31 @@
  * (`ctx.sessions.binding(id).session.projections.faceOf('taskManager')`).
  */
 
-import { defineTool } from '@deepseek-ai/dsh-tools';
+// No imports: a third-party bundle is loaded by path from wherever it is
+// linked, so a bare `@deepseek-ai/...` specifier only resolves when the bundle
+// happens to ship its own node_modules — and a stale/dangling one takes the
+// whole plugin down at boot (`ERR_MODULE_NOT_FOUND`). `ctx.tools.register()`
+// accepts a plain definition object with raw JSON Schema, so the tool needs no
+// helper at all.
 
 const name = 'task-manager';
+// `commands` is the sanctioned Client-callable Host entry point: the Client UI
+// runs the `tasks-sync` command through `ctx.remote.commands.execute()`, and the
+// command/done lifecycle event it logs carries the same `TASK_STATE::` marker the
+// tool result does — so the projection folds BOTH model writes and user writes
+// into one replayable list. It is fetched with `ctx.get('commands')` rather than
+// injected, so the plugin still activates in profiles that lack the command
+// registry (the panel's writes then surface a visible error instead).
 const inject = ['tools', 'sessionProjections'];
 
 /** Allowed task statuses. */
 const STATUSES = ['todo', 'doing', 'done'];
 /** Cursor used to embed the machine-readable task state in the tool's result text. */
 const MARKER = 'TASK_STATE::';
+/** The model-facing tool whose result carries the marker. */
+const TOOL_NAME = 'task_write';
+/** The Client-callable command whose result carries the marker. */
+const COMMAND_NAME = 'tasks-sync';
 
 let nextIdCounter = 0;
 /** Mint a stable, short, collision-resistant task id for this process. */
@@ -123,6 +139,21 @@ function decodeStateFromContent(content) {
         }
       }
     }
+  }
+  return undefined;
+}
+
+/** Parse the marker line out of a plain string (a command result text); returns tasks or undefined. */
+function decodeStateFromText(text) {
+  if (typeof text !== 'string') return undefined;
+  const at = text.indexOf(MARKER);
+  if (at < 0) return undefined;
+  const json = text.slice(at + MARKER.length).split('\n')[0].trim();
+  try {
+    const parsed = JSON.parse(json);
+    if (parsed && Array.isArray(parsed.tasks)) return parsed.tasks;
+  } catch {
+    return undefined;
   }
   return undefined;
 }
@@ -246,15 +277,65 @@ async function apply(ctx) {
 
   const handle = await ctx.sessionProjections.register({
     key: 'taskManager',
-    stateVersion: 1,
+    // v2 attributes each marker to its producer (see `apply`); v1 folded the
+    // marker wherever it appeared, so a session log echoed into the transcript
+    // (a `cat`, a grep hit, a pasted diff) could inject foreign tasks. Bumping
+    // the version invalidates those poisoned checkpoints.
+    stateVersion: 2,
     stateSchema,
-    init: () => ({ tasks: [] }),
+    init: () => ({ tasks: [], calls: {}, commands: {} }),
     apply: (state, event) => {
-      if (event.type !== 'tool/result') return state;
-      const content = event.data && event.data.message && event.data.message.content;
-      const tasks = decodeStateFromContent(content);
-      if (tasks === undefined) return state;
-      return { tasks };
+      // Two writers feed the one list:
+      //  - `tool/result`: the model's `task_write` output marker (model writes).
+      //  - `command/done`: the `tasks-sync` command the Client UI runs for user
+      //    edits (add / status / confirm / remove). Its result text carries the
+      //    same marker, so user edits become durable, replayable session events
+      //    exactly like model writes — no plugin-private store.
+      //
+      // Neither event names its producer (`tool/result` carries only a callId,
+      // `command/done` only a commandId), so each marker is trusted only when
+      // the matching start event — `tool/call` / `command/run` — named this
+      // plugin's tool or command. Anything else, including a marker quoted
+      // inside some unrelated tool's output, is ignored.
+      //
+      // Only our own calls are remembered (an absent callId is already
+      // untrusted), so the maps hold at most the handful of our calls that are
+      // still in flight rather than one entry per tool call in the session.
+      if (event.type === 'tool/call') {
+        const { callId, name } = event.data || {};
+        if (typeof callId !== 'string' || name !== TOOL_NAME) return state;
+        return { ...state, calls: { ...state.calls, [callId]: true } };
+      }
+      if (event.type === 'command/run') {
+        const { commandId, name } = event.data || {};
+        if (typeof commandId !== 'string' || name !== COMMAND_NAME) return state;
+        return { ...state, commands: { ...state.commands, [commandId]: true } };
+      }
+      if (event.type === 'tool/result') {
+        const message = event.data && event.data.message;
+        const callId = message && message.source && message.source.callId;
+        if (typeof callId !== 'string' || state.calls[callId] !== true) return state;
+        const calls = { ...state.calls };
+        delete calls[callId];
+        const tasks = decodeStateFromContent(message.content);
+        return tasks === undefined ? { ...state, calls } : { tasks, calls, commands: state.commands };
+      }
+      if (event.type === 'command/done') {
+        const commandId = event.data && event.data.commandId;
+        if (typeof commandId !== 'string' || state.commands[commandId] !== true) return state;
+        const commands = { ...state.commands };
+        delete commands[commandId];
+        const text = event.data && event.data.text;
+        const tasks = typeof text === 'string' ? decodeStateFromText(text) : undefined;
+        return tasks === undefined ? { ...state, commands } : { tasks, calls: state.calls, commands };
+      }
+      // Deliberately no per-turn cleanup: a `tasks-sync` the user triggers as a
+      // turn ends can log its `command/done` just after `turn/end`, and
+      // dropping the entry would silently discard that edit. The maps only ever
+      // hold our own in-flight calls, so an aborted call leaves at most one
+      // stale entry — and because call ids are unique, a stale entry can never
+      // authorize a later, unrelated result.
+      return state;
     },
     wire: {
       viewSchema,
@@ -270,40 +351,45 @@ async function apply(ctx) {
     return state && Array.isArray(state.tasks) ? state.tasks : [];
   }
 
-  ctx.tools.register(defineTool({
+  ctx.tools.register({
     name: 'task_write',
     description:
       'Maintain this session\'s task list, shown in a floating task card in the bottom-right corner of the window (collapsed to a pill by default; click to expand — it stays on top of the conversation). IMPORTANT: whenever you lay out an ordered implementation plan or a multi-step set of next actions for the user (e.g. "1. do X, 2. do Y, 3. do Z"), ALSO record those steps as tasks here — use action "replace" with the full ordered list, or one "add" per step — so the user sees and can start them from the card instead of having to copy text manually. Also use it to add follow-up tasks and to report progress. To report that a task (or several) is COMPLETE, prefer action "propose_done" (pass `ids`): this marks the tasks done but AWAITING the user\'s confirmation, which the card surfaces as a bulk confirm prompt — do NOT use set_status done for completion unless the user explicitly told you they are done. `ids` entries may be task ids OR titles that uniquely identify a task, so you do not need to re-`list` just to recover an id. Use action "set_status" only to move a task to todo/doing or to apply a status the user explicitly requested. Task fields: id, title, status (todo|doing|done), origin (model|user). The tool returns the complete updated list; ids are stable and are how you later update or remove a task.',
     parameters: {
-      action: {
-        type: 'string',
-        required: true,
-        enum: ['add', 'set_status', 'propose_done', 'remove', 'replace', 'clear', 'list'],
-        description: 'add: append one task; set_status: change one task status by id; propose_done: mark one or more tasks DONE pending the user\'s confirmation (use this to report completion; accepts ids or unique titles); remove: delete by id; replace: set the whole list (use for an ordered plan); clear: empty the list; list: read without changing.',
-      },
-      title: { type: 'string', description: 'For action "add": the task title.' },
-      detail: { type: 'string', description: 'For action "add": optional one-line detail.' },
-      status: { type: 'string', enum: STATUSES, description: 'For "add" (default todo) or "set_status": the target status.' },
-      id: { type: 'string', description: 'For "set_status" / "remove" / single-target "propose_done": the task id (propose_done also accepts a title that uniquely identifies one task).' },
-      ids: {
-        type: 'array',
-        description: 'For action "propose_done": the tasks to mark done pending confirmation (batch). Each entry is a task id, or a title — a title must identify exactly one task (exact match, or a unique prefix, ignoring case/whitespace/punctuation); ambiguous titles are rejected. Use "list" first if unsure.',
-        items: { type: 'string' },
-      },
-      position: { type: 'integer', description: 'For "add": 1-based insertion index; omit to append.' },
-      origin: { type: 'string', enum: ['model', 'user'], description: 'For "add": who created the task (default model).' },
-      tasks: {
-        type: 'array',
-        description: 'For action "replace": the complete ordered task list.',
-        items: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            id: { type: 'string' },
-            title: { type: 'string', required: true },
-            status: { type: 'string', enum: STATUSES },
-            detail: { type: 'string' },
-            origin: { type: 'string', enum: ['model', 'user'] },
+      type: 'object',
+      additionalProperties: false,
+      required: ['action'],
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['add', 'set_status', 'propose_done', 'remove', 'replace', 'clear', 'list'],
+          description: 'add: append one task; set_status: change one task status by id; propose_done: mark one or more tasks DONE pending the user\'s confirmation (use this to report completion; accepts ids or unique titles); remove: delete by id; replace: set the whole list (use for an ordered plan); clear: empty the list; list: read without changing.',
+        },
+        title: { type: 'string', description: 'For action "add": the task title.' },
+        detail: { type: 'string', description: 'For action "add": optional one-line detail.' },
+        status: { type: 'string', enum: STATUSES, description: 'For "add" (default todo) or "set_status": the target status.' },
+        id: { type: 'string', description: 'For "set_status" / "remove" / single-target "propose_done": the task id (propose_done also accepts a title that uniquely identifies one task).' },
+        ids: {
+          type: 'array',
+          description: 'For action "propose_done": the tasks to mark done pending confirmation (batch). Each entry is a task id, or a title — a title must identify exactly one task (exact match, or a unique prefix, ignoring case/whitespace/punctuation); ambiguous titles are rejected. Use "list" first if unsure.',
+          items: { type: 'string' },
+        },
+        position: { type: 'integer', description: 'For "add": 1-based insertion index; omit to append.' },
+        origin: { type: 'string', enum: ['model', 'user'], description: 'For "add": who created the task (default model).' },
+        tasks: {
+          type: 'array',
+          description: 'For action "replace": the complete ordered task list.',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            required: ['title'],
+            properties: {
+              id: { type: 'string' },
+              title: { type: 'string' },
+              status: { type: 'string', enum: STATUSES },
+              detail: { type: 'string' },
+              origin: { type: 'string', enum: ['model', 'user'] },
+            },
           },
         },
       },
@@ -312,18 +398,19 @@ async function apply(ctx) {
       schema: {
         type: 'object',
         additionalProperties: false,
+        required: ['tasks', 'counts'],
         properties: {
           tasks: {
             type: 'array',
-            required: true,
             items: {
               type: 'object',
               additionalProperties: false,
+              required: ['id', 'title', 'status', 'origin'],
               properties: {
-                id: { type: 'string', required: true },
-                title: { type: 'string', required: true },
-                status: { type: 'string', required: true, enum: STATUSES },
-                origin: { type: 'string', required: true, enum: ['model', 'user'] },
+                id: { type: 'string' },
+                title: { type: 'string' },
+                status: { type: 'string', enum: STATUSES },
+                origin: { type: 'string', enum: ['model', 'user'] },
                 detail: { type: 'string' },
                 proposedDone: { type: 'boolean' },
               },
@@ -332,11 +419,11 @@ async function apply(ctx) {
           counts: {
             type: 'object',
             additionalProperties: false,
-            required: true,
+            required: ['todo', 'doing', 'done'],
             properties: {
-              todo: { type: 'integer', required: true },
-              doing: { type: 'integer', required: true },
-              done: { type: 'integer', required: true },
+              todo: { type: 'integer' },
+              doing: { type: 'integer' },
+              done: { type: 'integer' },
             },
           },
         },
@@ -356,7 +443,56 @@ async function apply(ctx) {
       kind: 'other',
       rawInput: args,
     }),
-  }));
+  });
+
+  // ---- Client-callable write path (user edits) ----------------------------
+  //
+  // The Client card lets the user add tasks, change a status, confirm/dismiss a
+  // model completion probe, or remove a task. Those edits must land in the SAME
+  // session-log list the model reads, or the model keeps working from a stale
+  // list and the user's tasks vanish on fork/reload. A plugin cannot append a
+  // custom session event, but `commands` is the sanctioned Client→Host entry
+  // point, and the command lifecycle logs `command/run` + `command/done` as
+  // ordinary events. So we register an internal `tasks-sync` command whose
+  // handler applies the edit to the current list and returns the marker text;
+  // the projection folds that `command/done` text. The command is hidden from
+  // the model (it is the UI's transport, not a slash command a human types).
+  const commands = ctx.get('commands');
+  if (commands && typeof commands.register === 'function') {
+    // Registered inside `ctx.effect` so the disposer actually runs when this
+    // plugin unloads/reloads: `commands.register` rejects a duplicate name
+    // ("command \"tasks-sync\" is already registered"), and a leaked registration
+    // from a previous activation would then fail the whole Host half on reload.
+    ctx.effect(() => {
+      const dispose = commands.register({
+        name: 'tasks-sync',
+        description: 'Apply a task-list edit from the task card UI.',
+        // The payload JSON is the transport for a UI edit; it must not leak into
+        // the `command/run` event as `args` (the model would read it as raw JSON
+        // noise). Only the returned marker text — the authoritative new list — is
+        // logged via `command/done` and folded by the projection.
+        recordInput: false,
+        handler: async (invocation) => {
+          let payload;
+          try {
+            payload = JSON.parse(invocation.rawInput || '{}');
+          } catch {
+            return { kind: 'error', text: 'tasks-sync: invalid payload' };
+          }
+          try {
+            const current = currentTasks(invocation.agent);
+            const next = applyAction(payload.action, payload, current);
+            return { kind: 'success', text: encodeState(next) };
+          } catch (error) {
+            return { kind: 'error', text: `tasks-sync: ${error instanceof Error ? error.message : String(error)}` };
+          }
+        },
+      });
+      return () => {
+        if (typeof dispose === 'function') dispose();
+      };
+    }, 'task-manager: tasks-sync command');
+  }
 }
 
 export { apply, inject, name };

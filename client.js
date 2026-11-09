@@ -12,15 +12,20 @@
  *
  * Data sources
  * ------------
- * - Model tasks: read live from this plugin's session projection `taskManager`
- *   through the sessions client service:
- *   `ctx.sessions.binding(id).session.projections.faceOf('taskManager')`, a
- *   `{ getSnapshot, subscribe }` store bound with `useSyncExternalStore`. The
- *   host half writes it via the `task_write` tool, so when the model reports a
- *   task done the row updates by itself.
- * - User tasks: kept client-side per session in `localStorage` (installed
- *   bundles have no client→host RPC), tagged `origin: 'user'`. Adding a task
- *   appends it to the list — it is NOT copied into the chat composer.
+ * ONE source of truth: this plugin's session projection `taskManager`, read live
+ * through the sessions client service:
+ * `ctx.sessions.binding(id).session.projections.faceOf('taskManager')`, a
+ * `{ getSnapshot, subscribe }` store bound with `useSyncExternalStore`.
+ * - Model tasks: the host half writes them via the `task_write` tool (the model
+ *   reports a plan, marks progress, proposes completion), so rows update by
+ *   themselves as the model acts.
+ * - User tasks: the card writes them back to the SAME projection via the host
+ *   `tasks-sync` command (`ctx.remote.commands.execute`). Every user edit — add,
+ *   status change, remove, confirm/dismiss a completion proposal — is applied by
+ *   the command handler and folded from the resulting `command/done` event, so
+ *   the user's tasks are durable across fork/reload and visible to the model's
+ *   next `list`. Both writers are told apart by `origin: 'model' | 'user'`.
+ *   Adding a task appends it to the list — it is NOT copied into the composer.
  *
  * Starting a task
  * ---------------
@@ -38,6 +43,8 @@ window.__ModuleLoader__.load({
 
     const NS = '@caipj/dsh-task-manager';
     const OVERLAY_ID = 'task-manager';
+    // Host command name used as the Client→Host write path (see `syncToHost`).
+    const SYNC_COMMAND = 'tasks-sync';
 
     // Fallback strings; overridden by the locale service when available.
     const FALLBACK = {
@@ -78,6 +85,8 @@ window.__ModuleLoader__.load({
       stDoing: 'In progress',
       stDone: 'Done',
       reopen: 'Reopen',
+      syncFailed: 'Could not reach the host — the change was not saved. Try again.',
+      syncDismiss: 'Dismiss',
     };
 
     // Flat dictionaries registered with the locale service (locale/*.json only
@@ -121,6 +130,8 @@ window.__ModuleLoader__.load({
       stDoing: '进行中',
       stDone: '已完成',
       reopen: '重新打开',
+      syncFailed: '没能连上宿主，改动没有保存。请重试。',
+      syncDismiss: '知道了',
     };
 
     function fill(template, vars) {
@@ -137,37 +148,85 @@ window.__ModuleLoader__.load({
       done: 'var(--dsw-alias-state-success-primary, #2e9e5b)',
     };
 
-    // ---- per-session user-task store (localStorage) -------------------------
+    // ---- client → host write-back (user edits) ------------------------------
+    //
+    // The projection is read-only from a plugin, so every user edit — add,
+    // status change, remove, confirm/dismiss — is sent to the host `tasks-sync`
+    // command through the `commands` remote. The command handler applies the edit
+    // to the current list and returns the marker text; the projection folds the
+    // resulting `command/done`, so the SAME list the model reads also picks up
+    // the user's change. This keeps one source of truth (the session log) instead
+    // of a localStorage copy that forks/reloads would silently drop.
+    // Writes are SERIALIZED per session. Each `tasks-sync` handler reads the
+    // current list, applies its edit, and the projection only folds the resulting
+    // `command/done` after the handler settles — so two overlapping writes would
+    // both read the same pre-edit list and the later one would silently drop the
+    // earlier edit (a lost update: click "add" twice quickly and one task
+    // disappears). Chaining on a per-session promise makes each write start from
+    // the state the previous one produced.
+    const writeQueues = new Map();
 
-    function storageKey(sessionId) {
-      return `${NS}:user-tasks:${sessionId}`;
+    function enqueueWrite(sessionId, run) {
+      const previous = writeQueues.get(sessionId) || Promise.resolve();
+      const next = previous.then(run, run);
+      // Keep the chain alive but never let it grow: a settled tail is replaced on
+      // the next call, and failures are already handled inside `run`.
+      writeQueues.set(sessionId, next.then(() => {}, () => {}));
+      return next;
     }
 
-    function loadUserTasks(sessionId) {
-      if (!sessionId) return [];
-      try {
-        const raw = localStorage.getItem(storageKey(sessionId));
-        if (!raw) return [];
-        const parsed = JSON.parse(raw);
-        return Array.isArray(parsed) ? parsed : [];
-      } catch {
-        return [];
+    // Resolve the `commands` remote endpoint once. `remote`/`remote.commands`
+    // are declared in `inject`, which is what makes `ctx.remote` legal: cordis
+    // gates service PROPERTY access on the fiber's inject declaration and throws
+    // synchronously otherwise — reading `ctx.remote` undeclared used to abort the
+    // click handler before any write happened, so buttons looked dead.
+    function commandExec(ctx) {
+      if (!ctx) return null;
+      // `ctx.get(name)` is the optional-lookup form and never throws, so try it
+      // first; `ctx.remote` is the declared form (see `inject` below).
+      let remote;
+      if (typeof ctx.get === 'function') {
+        try {
+          remote = ctx.get('remote');
+        } catch {
+          remote = undefined;
+        }
       }
-    }
-
-    function saveUserTasks(sessionId, tasks) {
-      if (!sessionId) return;
-      try {
-        localStorage.setItem(storageKey(sessionId), JSON.stringify(tasks));
-      } catch {
-        /* quota / privacy mode — ignore, in-memory still works this session */
+      if (remote === undefined) {
+        try {
+          remote = ctx.remote;
+        } catch {
+          remote = undefined;
+        }
       }
+      const commands = remote && remote.commands;
+      if (!commands || typeof commands.execute !== 'function') return null;
+      return commands.execute.bind(commands);
     }
 
-    let userSeq = 0;
-    function mintUserId() {
-      userSeq += 1;
-      return `u${Date.now().toString(36)}${userSeq.toString(36)}`;
+    function syncToHost(ctx, sessionId, payload) {
+      if (!sessionId) return Promise.resolve({ ok: false });
+      let exec = null;
+      try {
+        exec = commandExec(ctx);
+      } catch {
+        exec = null;
+      }
+      if (exec === null) return Promise.resolve({ ok: false });
+      const line = `/tasks-sync ${JSON.stringify(payload)}`;
+      return enqueueWrite(sessionId, () => Promise.resolve(exec(sessionId, line, [])).then((resp) => {
+        if (!resp || !resp.ok) {
+          if (typeof console !== 'undefined' && console.warn) {
+            console.warn('[task-manager] tasks-sync failed', resp);
+          }
+        }
+        return resp;
+      }).catch((err) => {
+        if (typeof console !== 'undefined' && console.warn) {
+          console.warn('[task-manager] tasks-sync error', err);
+        }
+        return { ok: false };
+      }));
     }
 
     // ---- cross-component "add to tasks" bus ---------------------------------
@@ -309,71 +368,6 @@ window.__ModuleLoader__.load({
       },
     };
 
-    // ---- per-session confirmation store (model-task done proposals) ---------
-    //
-    // The model marks a task `proposedDone` by calling `propose_done`; that lives
-    // in the host projection and cannot be rewritten from here. So the user's
-    // confirmation ("yes, it's really done") / dismissal lives client-side, keyed
-    // by the model task id, in `{[taskId]: 'confirmed' | 'dismissed'}`.
-
-    function confirmKey(sessionId) {
-      return `${NS}:confirmations:${sessionId}`;
-    }
-
-    function loadConfirmations(sessionId) {
-      if (!sessionId) return {};
-      try {
-        const raw = localStorage.getItem(confirmKey(sessionId));
-        if (!raw) return {};
-        const parsed = JSON.parse(raw);
-        return parsed && typeof parsed === 'object' ? parsed : {};
-      } catch {
-        return {};
-      }
-    }
-
-    function saveConfirmations(sessionId, map) {
-      if (!sessionId) return;
-      try {
-        localStorage.setItem(confirmKey(sessionId), JSON.stringify(map));
-      } catch {
-        /* ignore quota / privacy mode */
-      }
-    }
-
-    // ---- per-session local overrides for MODEL tasks ------------------------
-    //
-    // The model's tasks live in the host projection, which an installed plugin
-    // cannot rewrite. So the user's own actions on them (mark done, remove) are
-    // recorded here, keyed by model task id: `{[id]: {status?, hidden?}}`. The
-    // projection stays the source of truth for the task text; this map only
-    // overlays the parts the user edited.
-
-    function modelEditKey(sessionId) {
-      return `${NS}:model-edits:${sessionId}`;
-    }
-
-    function loadModelEdits(sessionId) {
-      if (!sessionId) return {};
-      try {
-        const raw = localStorage.getItem(modelEditKey(sessionId));
-        if (!raw) return {};
-        const parsed = JSON.parse(raw);
-        return parsed && typeof parsed === 'object' ? parsed : {};
-      } catch {
-        return {};
-      }
-    }
-
-    function saveModelEdits(sessionId, map) {
-      if (!sessionId) return;
-      try {
-        localStorage.setItem(modelEditKey(sessionId), JSON.stringify(map));
-      } catch {
-        /* ignore quota / privacy mode */
-      }
-    }
-
     // ---- persisted floating-widget position ---------------------------------
 
     function posKey() {
@@ -410,7 +404,7 @@ window.__ModuleLoader__.load({
       }
     }
 
-    // ---- projection reader (model tasks) -----------------------------------
+    // ---- projection reader (the one task list) -----------------------------
 
     const EMPTY = { getSnapshot: () => undefined, subscribe: () => () => {} };
 
@@ -428,7 +422,7 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function useModelTasks(ctx, sessionId) {
+    function useProjectionTasks(ctx, sessionId) {
       const face = React.useMemo(() => projectionFace(ctx, sessionId), [ctx, sessionId]);
       const snapshot = React.useSyncExternalStore(
         face.subscribe,
@@ -470,28 +464,25 @@ window.__ModuleLoader__.load({
       const sessionId = useActiveSessionId(useSessions);
       const onConversation = useOnConversationPage(usePanelInfo);
 
-      const modelTasks = useModelTasks(ctx, sessionId);
+      // All tasks now live in the one host projection (`taskManager`): the model
+      // writes via `task_write`, the user writes via the `tasks-sync` command, and
+      // both fold into the same list. The `origin` field tells them apart for the
+      // badge; there is no separate localStorage list anymore.
+      const tasks = useProjectionTasks(ctx, sessionId);
 
-      const [userTasks, setUserTasks] = React.useState(() => loadUserTasks(sessionId));
-      // Reload user tasks when the active session changes.
-      React.useEffect(() => {
-        setUserTasks(loadUserTasks(sessionId));
-      }, [sessionId]);
-
-      // A selection bubble elsewhere in the overlay can push text here; append it
-      // as a user task and expand the card so the user sees it land. We read the
-      // latest sessionId via a ref so the subscription stays stable.
+      // A selection bubble elsewhere in the overlay can push text here; send each
+      // title to the host as a user task and expand the card so the user sees it
+      // land. We read the latest sessionId via a ref so the subscription stays
+      // stable.
       const sessionRef = React.useRef(sessionId);
       sessionRef.current = sessionId;
       React.useEffect(() => {
         return taskBus.subscribe((titles) => {
           const sid = sessionRef.current;
           if (!sid) return;
-          const current = loadUserTasks(sid);
-          const added = titles.map((title) => ({ id: mintUserId(), title, status: 'todo', origin: 'user' }));
-          const next = [...current, ...added];
-          saveUserTasks(sid, next);
-          setUserTasks(next);
+          for (const title of titles) {
+            write({ action: 'add', title, origin: 'user' }, sid);
+          }
           setOpen(true);
         });
       }, []);
@@ -500,6 +491,10 @@ window.__ModuleLoader__.load({
       const [open, setOpen] = React.useState(false);
       // Task awaiting the user's "really send this?" confirmation.
       const [confirmStart, setConfirmStart] = React.useState(null);
+      // Set when the last write could not reach the host. Without this the panel
+      // would look like it silently ignored the click: the list is host-owned now,
+      // so a failed write means the row simply never appears.
+      const [syncError, setSyncError] = React.useState(false);
 
       // Drag-to-move: null = default anchored position (bottom-right). Once the
       // user drags, we pin an absolute {x,y} (top-left of the widget) instead and
@@ -585,125 +580,66 @@ window.__ModuleLoader__.load({
         window.removeEventListener('mouseup', endDrag);
       }, []);
 
-      const [confirmations, setConfirmations] = React.useState(() => loadConfirmations(sessionId));
-      // Reload confirmations when the active session changes.
-      React.useEffect(() => {
-        setConfirmations(loadConfirmations(sessionId));
-      }, [sessionId]);
+      // ---- host write-back primitives --------------------------------------
 
-      function commitConfirmations(next) {
-        setConfirmations(next);
-        saveConfirmations(sessionId, next);
-      }
-
-      function setConfirmation(id, value) {
-        commitConfirmations({ ...confirmations, [id]: value });
-      }
-
-      // A completion proposal must be answered PER PROPOSAL, not once per task
-      // forever. `startTask` records a dismissal for model tasks (so the card
-      // does not nag right after the user sends one off), and a dismissal also
-      // means "the model was wrong, it is not done" — either way that stored
-      // answer would silently swallow any LATER genuine `propose_done` on the
-      // same id. So track which ids the projection currently marks proposed,
-      // and drop the stored answer when an id NEWLY (re)appears there.
-      const proposedNow = modelTasks
-        .filter((task) => task.proposedDone === true)
-        .map((task) => task.id)
-        .join(',');
-      const proposedSeenRef = React.useRef({ sessionId: undefined, ids: new Set() });
-      React.useEffect(() => {
-        const ids = new Set(proposedNow ? proposedNow.split(',') : []);
-        // The first run for a session only records a baseline: a page reload — or
-        // switching to another session — must NOT wipe answers the user already
-        // gave to proposals that were on screen there.
-        if (proposedSeenRef.current.sessionId !== sessionId) {
-          proposedSeenRef.current = { sessionId, ids };
-          return;
+      // Wrap a write so a failure is visible in the card instead of silently
+      // dropping the user's click. The host list is authoritative, so a failed
+      // write leaves the row absent and the user would otherwise think the button
+      // is broken.
+      function write(payload, target) {
+        // `target` exists for the selection-bubble subscription: that effect is
+        // mounted once, so it must pass the live session id from its ref instead
+        // of the `sessionId` captured by this render.
+        const sid = target === undefined ? sessionId : target;
+        let pending;
+        try {
+          pending = syncToHost(ctx, sid, payload);
+        } catch (err) {
+          // A synchronous throw here (service access, JSON, a broken remote) used
+          // to kill the click handler silently — the button looked dead and no
+          // error line appeared. Surface it instead.
+          if (typeof console !== 'undefined' && console.warn) {
+            console.warn('[task-manager] tasks-sync threw', err);
+          }
+          if (sid) setSyncError(true);
+          return Promise.resolve({ ok: false });
         }
-        const previous = proposedSeenRef.current.ids || new Set();
-        const fresh = [...ids].filter((id) => !previous.has(id));
-        proposedSeenRef.current = { sessionId, ids };
-        if (!fresh.length) return;
-        const stored = loadConfirmations(sessionId);
-        const stale = fresh.filter((id) => stored[id] !== undefined);
-        if (!stale.length) return;
-        const next = { ...stored };
-        for (const id of stale) delete next[id];
-        saveConfirmations(sessionId, next);
-        setConfirmations(next);
-      }, [sessionId, proposedNow]);
-
-      // User edits applied to MODEL tasks (the projection itself is read-only
-      // from a plugin): `{status?, hidden?}` per model task id.
-      const [modelEdits, setModelEdits] = React.useState(() => loadModelEdits(sessionId));
-      React.useEffect(() => {
-        setModelEdits(loadModelEdits(sessionId));
-      }, [sessionId]);
-
-      function commitModelEdits(next) {
-        setModelEdits(next);
-        saveModelEdits(sessionId, next);
-      }
-
-      function editModelTask(id, patch) {
-        commitModelEdits({ ...modelEdits, [id]: { ...(modelEdits[id] || {}), ...patch } });
-      }
-
-      function removeModelTask(id) {
-        editModelTask(id, { hidden: true });
-      }
-
-      function commitUserTasks(next) {
-        setUserTasks(next);
-        saveUserTasks(sessionId, next);
+        Promise.resolve(pending).then((resp) => {
+          if (resp && resp.ok) setSyncError(false);
+          else if (sid) setSyncError(true);
+        }, () => {
+          if (sid) setSyncError(true);
+        });
+        return pending;
       }
 
       function addTask() {
         const title = draft.trim();
         if (title.length === 0) return;
-        const task = {
-          id: mintUserId(),
-          title,
-          status: 'todo',
-          origin: 'user',
-        };
-        // Add to the list only; never copy into the chat composer.
-        commitUserTasks([...userTasks, task]);
+        // Add to the list only; never copy into the chat composer. The host
+        // `tasks-sync` command applies the add and the projection folds it, so the
+        // new row appears from the same source the model reads.
+        write({ action: 'add', title, origin: 'user' });
         setDraft('');
       }
 
-      function removeUserTask(id) {
-        commitUserTasks(userTasks.filter((task) => task.id !== id));
+      function removeTask(id) {
+        write({ action: 'remove', id });
       }
 
-      function setUserStatus(id, status) {
-        commitUserTasks(userTasks.map((task) => (task.id === id ? { ...task, status } : task)));
+      function setStatus(id, status) {
+        write({ action: 'set_status', id, status });
       }
 
-      // "Clear done" must cover BOTH sources: user tasks live in `userTasks`,
-      // model tasks live in the read-only projection so they can only be hidden
-      // locally (same mechanism as the per-row ✕). Tasks still awaiting the
-      // user's completion confirmation are left alone — they are surfaced in the
-      // confirm banner and must not vanish before the user answers it.
+      // "Clear done" removes every completed task that is NOT still awaiting the
+      // user's completion confirmation. Both origins live in the same host list
+      // now, so a single `remove` per task covers both.
       function clearDoneTasks() {
-        const doneUserId = new Set();
-        const nextModelEdits = { ...modelEdits };
-        let modelChanged = false;
         for (const task of merged) {
           if (task._pendingConfirm) continue;
           if (task.status !== 'done') continue;
-          if (task._source === 'user') {
-            doneUserId.add(task.id);
-          } else {
-            nextModelEdits[task.id] = { ...(nextModelEdits[task.id] || {}), hidden: true };
-            modelChanged = true;
-          }
+          write({ action: 'remove', id: task.id });
         }
-        if (doneUserId.size > 0) {
-          commitUserTasks(userTasks.filter((task) => !doneUserId.has(task.id)));
-        }
-        if (modelChanged) commitModelEdits(nextModelEdits);
       }
 
       // Ask before sending: the user asked for an explicit confirmation step so a
@@ -732,47 +668,29 @@ window.__ModuleLoader__.load({
         // reflect that immediately instead of leaving it sitting in "to do" until
         // the user clicks the status button. Never downgrade an already-done task.
         if (sent && task.status !== 'doing' && task.status !== 'done') {
-          if (task._source === 'user') {
-            setUserStatus(task.id, 'doing');
-          } else {
-            editModelTask(task.id, { status: 'doing' });
-            setConfirmation(task.id, 'dismissed');
-          }
+          setStatus(task.id, 'doing');
         }
         // Collapse the floating card so the conversation is unobstructed.
         if (sent) setOpen(false);
       }
 
-      // Merge: model tasks (live) then user tasks (local), each group ordered.
-      // For model tasks the model may have proposed completion (`proposedDone`);
-      // the row shows "awaiting confirmation" until the user confirms/dismisses it
-      // (stored in `confirmations[taskId]`).
-      const modelRows = modelTasks
-        .filter((task) => !(modelEdits[task.id] && modelEdits[task.id].hidden))
-        .map((task) => {
-          const decision = confirmations[task.id];
-          // A proposal is PENDING only until the user answers it. BOTH 'confirmed'
-          // and 'dismissed' are answers. Before this fix `decision !== 'confirmed'`
-          // left a dismissed proposal showing the "awaiting confirm" badge forever
-          // (while the banner was already gone), so the row looked stuck.
-          const pendingConfirm = task.proposedDone === true && decision === undefined;
-          const edit = modelEdits[task.id] || {};
-          // A local status edit wins over the projection's status so a user's
-          // "done" click is visible even though the host record is unchanged.
-          // A DISMISSED proposal means "the model is wrong, it is not done", so the
-          // row falls back to to-do instead of pretending to be finished.
-          // Precedence: an ACCEPTED proposal means the task is done (even if the
-          // user had marked it "in progress" before the model reported it); then
-          // the user's own local edit; then a rejected proposal falls back to
-          // to-do; otherwise the projection's own status.
-          const status = decision === 'confirmed'
-            ? 'done'
-            : edit.status || (decision === 'dismissed' ? 'todo' : task.status);
-          return { ...task, status, _source: 'model', _pendingConfirm: pendingConfirm };
-        });
+      // Merge: model tasks then user tasks, split only for the origin badge. The
+      // host status is authoritative — there is no local overlay anymore. A model
+      // task stays `proposedDone` (and therefore shows the confirm affordance)
+      // until the user confirms/dismisses it; that answer is itself a `set_status`
+      // write (done on confirm, todo on dismiss) which clears `proposedDone`.
+      const modelRows = tasks
+        .filter((task) => task.origin !== 'user')
+        .map((task) => ({
+          ...task,
+          _source: 'model',
+          _pendingConfirm: task.proposedDone === true,
+        }));
       const merged = [
         ...modelRows,
-        ...userTasks.map((task) => ({ ...task, _source: 'user', _pendingConfirm: false })),
+        ...tasks
+          .filter((task) => task.origin === 'user')
+          .map((task) => ({ ...task, _source: 'user', _pendingConfirm: false })),
       ];
 
       // Tasks the model proposed as done that the user has not yet confirmed.
@@ -791,52 +709,35 @@ window.__ModuleLoader__.load({
       const styles = makeStyles();
 
       function confirmAll() {
-        const next = { ...confirmations };
-        for (const task of pendingConfirms) next[task.id] = 'confirmed';
-        commitConfirmations(next);
+        for (const task of pendingConfirms) setStatus(task.id, 'done');
       }
       function dismissAll() {
-        const next = { ...confirmations };
-        for (const task of pendingConfirms) next[task.id] = 'dismissed';
-        commitConfirmations(next);
+        for (const task of pendingConfirms) setStatus(task.id, 'todo');
       }
 
-      // Advance a task's status. For MODEL tasks the projection cannot be
-      // rewritten, so the change is recorded in `modelEdits` (and a "done" also
-      // records the user's confirmation of the model's own completion proposal).
-      // The row's single status control. It always shows TEXT ("mark in
-      // progress" / "complete" / "reopen") so the state never has to be guessed
-      // from a colour, and a done task offers "reopen" instead of a second
+      // Advance a task's status. Both origins now live in the host projection, so
+      // every change is a `set_status` write; "done" on a model task that had a
+      // pending completion proposal also clears `proposedDone` (the host drops it
+      // on any `set_status`). The row's single status control always shows TEXT
+      // ("mark in progress" / "complete" / "reopen") so the state never has to be
+      // guessed from a colour, and a done task offers "reopen" instead of a second
       // "complete" that would do nothing.
       function statusButton(task) {
-        const isUser = task._source === 'user';
-        const apply = (next) => {
-          if (isUser) {
-            setUserStatus(task.id, next);
-          } else {
-            // Model tasks live in the host projection (read-only here), so the
-            // user's edit is recorded locally; "done" also confirms the model's
-            // own completion proposal so the pending banner clears.
-            editModelTask(task.id, { status: next });
-            if (next === 'done') setConfirmation(task.id, 'confirmed');
-            else setConfirmation(task.id, 'dismissed');
-          }
-        };
         if (task.status === 'done') {
           return h('button', {
             style: styles.btn, title: t('reopen'), 'aria-label': t('reopen'),
-            onClick: () => apply('todo'),
+            onClick: () => setStatus(task.id, 'todo'),
           }, t('reopen'));
         }
         if (task.status === 'doing') {
           return h('button', {
             style: styles.btn, title: t('markDone'), 'aria-label': t('markDone'),
-            onClick: () => apply('done'),
+            onClick: () => setStatus(task.id, 'done'),
           }, `✓ ${t('complete')}`);
         }
         return h('button', {
           style: styles.btn, title: t('markDoing'), 'aria-label': t('markDoing'),
-          onClick: () => apply('doing'),
+          onClick: () => setStatus(task.id, 'doing'),
         }, t('markDoing'));
       }
 
@@ -875,7 +776,7 @@ window.__ModuleLoader__.load({
             : null,
           pending
             ? h('button', {
-                style: styles.primaryBtn, title: t('confirm'), onClick: () => setConfirmation(task.id, 'confirmed'),
+                style: styles.primaryBtn, title: t('confirm'), onClick: () => setStatus(task.id, 'done'),
               }, t('confirm'))
             : null,
           statusButton(task),
@@ -886,7 +787,7 @@ window.__ModuleLoader__.load({
             : h('button', { style: styles.btn, onClick: () => requestStart(task), title: t('start') }, t('start')),
           h('button', {
             style: styles.btn,
-            onClick: () => (isUser ? removeUserTask(task.id) : removeModelTask(task.id)),
+            onClick: () => removeTask(task.id),
             title: isUser ? t('remove') : t('removeModel'),
           }, '✕'),
         );
@@ -981,6 +882,16 @@ window.__ModuleLoader__.load({
                       h('button', { style: styles.btn, onClick: dismissAll }, t('dismiss')),
                     )
                   : null,
+                syncError
+                  ? h('div', { style: styles.syncBar },
+                      h('span', { style: styles.confirmText }, t('syncFailed')),
+                      h('button', {
+                        style: styles.btn,
+                        onClick: () => setSyncError(false),
+                        title: t('syncDismiss'),
+                      }, t('syncDismiss')),
+                    )
+                  : null,
                 merged.length === 0
                   ? h('div', { style: styles.empty }, t('empty'))
                   : h('ul', { style: styles.list }, rows),
@@ -1028,6 +939,7 @@ window.__ModuleLoader__.load({
         // a hard #fff, which would be white-on-white in dark mode.
         accent: 'var(--dsw-alias-brand-primary)',
         success: 'var(--dsw-alias-state-success-primary)',
+        danger: 'var(--dsw-alias-state-error-primary)',
         onAccent: 'var(--dsw-alias-bg-base)',
       };
       return {
@@ -1115,6 +1027,19 @@ window.__ModuleLoader__.load({
           border: `1px solid ${C.accent}`,
           background: C.surface2,
           backgroundColor: 'color-mix(in srgb, var(--dsw-alias-brand-primary) 12%, transparent)',
+        },
+        // Write failed: the host list is authoritative, so the edit was lost.
+        // Error-tinted bar so it is never mistaken for a normal status banner.
+        syncBar: {
+          display: 'flex',
+          alignItems: 'center',
+          gap: '6px',
+          flexWrap: 'wrap',
+          padding: '7px 9px',
+          borderRadius: '8px',
+          border: `1px solid ${C.danger}`,
+          background: C.surface2,
+          backgroundColor: 'color-mix(in srgb, var(--dsw-alias-state-error-primary) 14%, transparent)',
         },
         pendingBadge: {
           flex: '0 0 auto',
@@ -1390,7 +1315,14 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      inject: ['slots', 'locale'],
+      // `remote` + `remote.commands` are declared because cordis gates service
+      // PROPERTY access on the fiber's inject declaration: reading `ctx.remote`
+      // while undeclared throws synchronously, which made every card button look
+      // dead (the click handler died before any write). Declaring them is also
+      // what dsh-btw does for the same `commands.execute` call. `syncToHost` still
+      // guards the lookup so a profile without the remote degrades to a visible
+      // "could not reach the host" line instead of losing the panel.
+      inject: ['slots', 'locale', 'remote', 'remote.commands'],
       apply(ctx) {
         // `locale` is a hard inject here (accessed as ctx.locale): ctx.get('locale')
         // can be undefined for a merely-service-aware context, which silently
@@ -1462,6 +1394,29 @@ window.__ModuleLoader__.load({
         ctx.slots.inject('shell.overlay', () => {
           mount();
           return () => unmount();
+        });
+
+        // The `tasks-sync` command is a UI→Host transport, not something the user
+        // typed: its `command/done` text carries the `TASK_STATE::` marker line.
+        // The chat stream renders every command node with that text as its summary
+        // (`GenericCommandCard`), which would dump raw JSON into the conversation.
+        // Registering a `null` renderer for this one command name keeps the
+        // lifecycle in the log (needed for projection replay) but out of the UI.
+        // Waiting for the slot to appear (instead of registering eagerly) mirrors
+        // how other bundles hook a slot owned by the chat package.
+        ctx.slots.inject('conversation.chat.commandview', () => {
+          let dispose = null;
+          try {
+            dispose = ctx.slots.register({
+              name: 'conversation.chat.commandview',
+              key: SYNC_COMMAND,
+            }, () => null);
+          } catch {
+            dispose = null;
+          }
+          return () => {
+            if (dispose) { try { dispose(); } catch {} dispose = null; }
+          };
         });
 
         // Dispose the locale dictionaries when the plugin itself unloads.
