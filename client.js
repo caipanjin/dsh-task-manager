@@ -72,12 +72,17 @@ window.__ModuleLoader__.load({
       archiveDone: 'Archive done',
       archive: 'Archive',
       archiveTitle: 'Archive',
+      archiveSectionTitle: 'Archived (kept, not deleted)',
       archiveEmpty: 'No archived tasks yet.',
       archiveHint: 'Archived tasks are kept, not deleted.',
       restore: 'Restore',
       deleteForever: 'Delete forever',
       showArchive: 'Archive',
+      expandArchive: 'Show archive',
+      collapseArchive: 'Hide archive',
       backToTasks: 'Back to list',
+      emptyAll: 'No tasks yet — add one below.',
+      emptyAllArchived: 'Nothing active. {n} task(s) are in the archive — open it above, or add a new one below.',
       openPanel: 'Show tasks',
       collapse: 'Collapse',
       dragHint: 'Drag to move',
@@ -130,12 +135,17 @@ window.__ModuleLoader__.load({
       archiveDone: '归档已完成',
       archive: '归档',
       archiveTitle: '归档',
+      archiveSectionTitle: '已归档（保留，未删除）',
       archiveEmpty: '还没有归档的任务。',
       archiveHint: '归档只移出列表，不会删除。',
       restore: '恢复',
       deleteForever: '彻底删除',
       showArchive: '归档',
+      expandArchive: '展开归档',
+      collapseArchive: '收起归档',
       backToTasks: '返回列表',
+      emptyAll: '还没有任务，在下面添加。',
+      emptyAllArchived: '当前没有待办，{n} 项已归档——可在上方展开归档查看，或在下方新建。',
       openPanel: '显示任务',
       collapse: '收起',
       dragHint: '拖动移动位置',
@@ -561,9 +571,12 @@ window.__ModuleLoader__.load({
       // would look like it silently ignored the click: the list is host-owned now,
       // so a failed write means the row simply never appears.
       const [syncError, setSyncError] = React.useState(false);
-      // Which view the card shows. The archive is a separate view rather than a
-      // section, so a long history never pushes the working list out of reach.
-      const [view, setView] = React.useState('list');
+      // The archive is a SECTION under the list, not a separate view: replacing
+      // the whole card made the toggle read as "leave task management" and hid
+      // the working list, so the user could not tell where they were. Collapsed
+      // by default; opening it appends the filed-away rows below the list, and
+      // the list stays visible (and scrollable) above them.
+      const [archiveOpen, setArchiveOpen] = React.useState(false);
       // The task being edited inline (`{ id, title, detail }`) plus the draft the
       // user is typing. The card's single add box only ever sets the title; this
       // is where the second line (detail) becomes reachable for user tasks, and
@@ -1137,20 +1150,18 @@ window.__ModuleLoader__.load({
             // Pushes the archive controls to the right edge; absorbs the shrink
             // when the card is narrow so the buttons stay on one line.
             h('span', { style: styles.headerSpacer }),
-            // Archive entry: always visible (with its count) so the archive is
-            // discoverable even when it is empty — this is the "query entry" for
-            // filed-away work.
+            // Archive toggle: always visible (with its count) so the archive is
+            // discoverable even when it is empty. It is a disclosure control now,
+            // not a navigation one — the caret says "this expands".
             h('button', {
-              style: view === 'archive' ? styles.activeBtn : styles.btn,
-              onClick: () => setView(view === 'archive' ? 'list' : 'archive'),
-              title: view === 'archive' ? t('backToTasks') : t('archiveHint'),
+              style: archiveOpen ? styles.activeBtn : styles.btn,
+              onClick: () => setArchiveOpen((cur) => !cur),
+              title: archiveOpen ? t('collapseArchive') : t('expandArchive'),
+              'aria-expanded': archiveOpen ? 'true' : 'false',
               'data-tm-archive': '1',
             },
-              t('showArchive'),
-              archivedRows.length > 0
-                ? h('span', { style: styles.archiveCount }, ` ${archivedRows.length}`)
-                : null),
-            counts.done > 0 && view === 'list'
+              `${archiveOpen ? '▾' : '▸'} ${t('showArchive')} (${archivedRows.length})`),
+            counts.done > 0
               ? h('button', { style: styles.btn, onClick: archiveDoneTasks, title: t('archiveHint'), 'data-tm-archive-done': '1' }, t('archiveDone'))
               : null,
             h('button', {
@@ -1212,27 +1223,39 @@ window.__ModuleLoader__.load({
                       }, t('cancel')),
                     )
                   : null,
-                view === 'archive'
-                  ? h('div', { style: styles.bodyInner },
+                // The working list is ALWAYS rendered: opening the archive adds a
+                // section below it instead of swapping the card's contents, so the
+                // user never loses sight of where they are or of the todo list.
+                activeRows.length === 0
+                  ? h('div', { style: styles.empty },
+                      // An empty list means one of three different things; saying
+                      // "no tasks yet" while the header shows "Archive (1)" is
+                      // contradictory, so point at the archive instead.
+                      merged.length === 0
+                        ? t('emptyAll')
+                        : archivedRows.length > 0
+                          ? fill(t('emptyAllArchived'), { n: archivedRows.length })
+                          : t('empty'))
+                  : h('ul', { style: styles.list }, rows),
+                archiveOpen
+                  ? h('div', { style: styles.archiveSection, 'data-tm-archive-section': '1' },
                       h('div', { style: styles.archiveHead },
-                        h('span', { style: styles.counts }, `${t('archiveTitle')} · ${archivedRows.length}`),
-                        h('span', { style: styles.archiveHintText }, t('archiveHint')),
+                        h('span', { style: styles.archiveHeadTitle },
+                          `${t('archiveSectionTitle')} · ${archivedRows.length}`),
+                        h('span', { style: styles.headerSpacer }),
+                        h('button', {
+                          style: styles.btn,
+                          onClick: () => setArchiveOpen(false),
+                          title: t('collapseArchive'),
+                          'data-tm-archive-collapse': '1',
+                        }, `▴ ${t('collapseArchive')}`),
                       ),
                       archivedRows.length === 0
                         ? h('div', { style: styles.empty }, t('archiveEmpty'))
                         : h('ul', { style: styles.list, 'data-tm-archive-list': '1' }, archiveRows),
                     )
-                  : activeRows.length === 0 && merged.length > 0
-                    ? h('div', { style: styles.bodyInner },
-                        h('div', { style: styles.empty }, t('empty')),
-                        h('button', { style: styles.btn, onClick: () => setView('archive') }, `${t('showArchive')} ${archivedRows.length}`),
-                      )
-                    : activeRows.length === 0
-                      ? h('div', { style: styles.empty }, t('empty'))
-                      : h('ul', { style: styles.list }, rows),
-                view === 'archive'
-                  ? null
-                  : h('div', { style: styles.addRow },
+                  : null,
+                h('div', { style: styles.addRow },
                   h('input', {
                     style: styles.input,
                     value: draft,
@@ -1462,13 +1485,25 @@ window.__ModuleLoader__.load({
           borderRadius: '6px',
         },
         body: { padding: '10px 12px', overflow: 'auto' },
-        // Archive view: a quiet header line above the filed-away rows.
-        archiveHead: { display: 'flex', alignItems: 'baseline', gap: '8px', flexWrap: 'wrap', justifyContent: 'flex-start' },
+        // Archive section under the list: a hairline above, its own scroll area
+        // so a long history never pushes the working list off the card.
+        archiveSection: {
+          marginTop: '6px',
+          paddingTop: '6px',
+          borderTop: `1px dashed ${C.border}`,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '6px',
+          minHeight: '0px',
+          maxHeight: '40vh',
+          overflow: 'auto',
+        },
+        archiveHead: { display: 'flex', alignItems: 'center', gap: '8px', minWidth: '0px', flexWrap: 'nowrap' },
+        archiveHeadTitle: { color: C.text2, fontSize: '11px', fontWeight: 600, flex: '0 0 auto' },
         archiveHintText: { color: C.text2, fontSize: '11px' },
         archiveStamp: { color: C.text2, fontSize: '11px', whiteSpace: 'nowrap' },
         // A count appended to the button label. Kept as plain dimmed text: a
         // bordered pill inside a bordered button reads like a nested button.
-        archiveCount: { color: C.text2, fontVariantNumeric: 'tabular-nums' },
         // Header button in its pressed/active state (the archive toggle while the
         // archive view is open).
         activeBtn: {
