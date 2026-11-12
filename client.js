@@ -87,6 +87,7 @@ window.__ModuleLoader__.load({
       reopen: 'Reopen',
       syncFailed: 'Could not reach the host — the change was not saved. Try again.',
       syncDismiss: 'Dismiss',
+      resizeHint: 'Drag to resize',
     };
 
     // Flat dictionaries registered with the locale service (locale/*.json only
@@ -132,6 +133,7 @@ window.__ModuleLoader__.load({
       reopen: '重新打开',
       syncFailed: '没能连上宿主，改动没有保存。请重试。',
       syncDismiss: '知道了',
+      resizeHint: '拖动调整宽度',
     };
 
     function fill(template, vars) {
@@ -404,6 +406,32 @@ window.__ModuleLoader__.load({
       }
     }
 
+    // Persisted card width (null = the default `min(560px, 100vw - 40px)`).
+    function widthKey() {
+      return `${NS}:widget-width`;
+    }
+
+    const MIN_CARD_WIDTH = 320;
+
+    function loadCardWidth() {
+      try {
+        const raw = localStorage.getItem(widthKey());
+        if (!raw) return null;
+        const n = Number(raw);
+        return Number.isFinite(n) && n >= MIN_CARD_WIDTH ? n : null;
+      } catch {
+        return null;
+      }
+    }
+
+    function saveCardWidth(width) {
+      try {
+        localStorage.setItem(widthKey(), String(Math.round(width)));
+      } catch {
+        /* ignore */
+      }
+    }
+
     // ---- projection reader (the one task list) -----------------------------
 
     const EMPTY = { getSnapshot: () => undefined, subscribe: () => () => {} };
@@ -500,6 +528,8 @@ window.__ModuleLoader__.load({
       // user drags, we pin an absolute {x,y} (top-left of the widget) instead and
       // persist it so the panel stays where they dropped it across remounts.
       const [pos, setPos] = React.useState(() => loadWidgetPos());
+      // Card width; null = default. Persisted so a resize survives remounts.
+      const [cardWidth, setCardWidth] = React.useState(() => loadCardWidth());
 
       // Drag state machine. `dragRef` holds transient values that must not
       // trigger re-renders each mousemove.
@@ -578,6 +608,53 @@ window.__ModuleLoader__.load({
       React.useEffect(() => () => {
         window.removeEventListener('mousemove', onDragMove);
         window.removeEventListener('mouseup', endDrag);
+      }, []);
+
+      // Width resize: the left edge is the handle. `resizeRef` mirrors dragRef so
+      // mousemove does not need a re-render per candidate value.
+      const resizeRef = React.useRef(null);
+
+      function beginResize(e) {
+        if (e.button !== 0) return;
+        // The card lives inside the move-drag wrapper; stop the resize gesture
+        // from also being read as a move.
+        e.preventDefault();
+        e.stopPropagation();
+        const card = e.currentTarget.parentElement;
+        const rect = card ? card.getBoundingClientRect() : null;
+        if (!rect) return;
+        resizeRef.current = {
+          startX: e.clientX,
+          startWidth: rect.width,
+          // Hard cap so the card never exceeds the viewport minus the 20px
+          // margins on both sides.
+          maxWidth: Math.max(MIN_CARD_WIDTH, (window.innerWidth || 0) - 40),
+        };
+        window.addEventListener('mousemove', onResizeMove);
+        window.addEventListener('mouseup', endResize);
+      }
+
+      function onResizeMove(e) {
+        const r = resizeRef.current;
+        if (!r) return;
+        // Dragging the left edge leftwards (negative dx) grows the card.
+        const next = Math.min(r.maxWidth, Math.max(MIN_CARD_WIDTH, r.startWidth - (e.clientX - r.startX)));
+        setCardWidth(Math.round(next));
+      }
+
+      function endResize() {
+        window.removeEventListener('mousemove', onResizeMove);
+        window.removeEventListener('mouseup', endResize);
+        resizeRef.current = null;
+        setCardWidth((cur) => {
+          if (cur) saveCardWidth(cur);
+          return cur;
+        });
+      }
+
+      React.useEffect(() => () => {
+        window.removeEventListener('mousemove', onResizeMove);
+        window.removeEventListener('mouseup', endResize);
       }, []);
 
       // ---- host write-back primitives --------------------------------------
@@ -706,7 +783,7 @@ window.__ModuleLoader__.load({
       const pendingCount = pendingConfirms.length;
 
       const activeCount = counts.todo + counts.doing;
-      const styles = makeStyles();
+      const styles = makeStyles({ width: cardWidth });
 
       function confirmAll() {
         for (const task of pendingConfirms) setStatus(task.id, 'done');
@@ -750,6 +827,13 @@ window.__ModuleLoader__.load({
         }, label);
       }
 
+      // One row = TWO lines: line 1 carries the small badges + the action
+      // buttons, line 2 carries the task text. The old layout put every chip and
+      // every button on the same flex line as the title, so at a 400px card the
+      // title was squeezed into a ~60px column and broke one character per line
+      // (a Chinese task became a vertical ribbon). Stacking gives the title the
+      // full card width; the buttons only cost the header line, which is short by
+      // nature.
       const rows = merged.map((task) => {
         const isUser = task._source === 'user';
         const pending = task._pendingConfirm;
@@ -758,9 +842,33 @@ window.__ModuleLoader__.load({
           ...(task.status === 'done' && !pending ? styles.doneLabel : {}),
         };
         return h('li', { key: `${task._source}:${task.id}`, style: styles.row },
-          h('span', { style: { ...styles.dot, background: STATUS_COLOR[task.status] || STATUS_COLOR.todo } }),
-          h('span', { style: styles.badge, title: isUser ? t('originUser') : t('originModel') },
-            isUser ? t('fromUser') : t('fromModel')),
+          h('div', { style: styles.rowHead },
+            h('span', { style: { ...styles.dot, background: STATUS_COLOR[task.status] || STATUS_COLOR.todo } }),
+            h('span', { style: styles.badge, title: isUser ? t('originUser') : t('originModel') },
+              isUser ? t('fromUser') : t('fromModel')),
+            statusChip(task),
+            pending
+              ? h('span', { style: styles.pendingBadge, title: t('proposed') }, t('proposed'))
+              : null,
+            // Pushes the buttons to the right edge of the head line.
+            h('span', { style: styles.rowSpacer }),
+            pending
+              ? h('button', {
+                  style: styles.primaryBtn, title: t('confirm'), onClick: () => setStatus(task.id, 'done'),
+                }, t('confirm'))
+              : null,
+            statusButton(task),
+            // "Start" only makes sense while the task is still to-do/in progress;
+            // a done task has nothing left to send.
+            task.status === 'done'
+              ? null
+              : h('button', { style: styles.btn, onClick: () => requestStart(task), title: t('start') }, t('start')),
+            h('button', {
+              style: styles.btn,
+              onClick: () => removeTask(task.id),
+              title: isUser ? t('remove') : t('removeModel'),
+            }, '✕'),
+          ),
           h('span', {
             style: labelStyle,
             title: task.detail ? `${task.title} — ${task.detail}` : task.title,
@@ -770,26 +878,6 @@ window.__ModuleLoader__.load({
               ? h('span', { style: styles.labelDetail }, task.detail)
               : null,
           ),
-          statusChip(task),
-          pending
-            ? h('span', { style: styles.pendingBadge, title: t('proposed') }, t('proposed'))
-            : null,
-          pending
-            ? h('button', {
-                style: styles.primaryBtn, title: t('confirm'), onClick: () => setStatus(task.id, 'done'),
-              }, t('confirm'))
-            : null,
-          statusButton(task),
-          // "Start" only makes sense while the task is still to-do/in progress;
-          // a done task has nothing left to send.
-          task.status === 'done'
-            ? null
-            : h('button', { style: styles.btn, onClick: () => requestStart(task), title: t('start') }, t('start')),
-          h('button', {
-            style: styles.btn,
-            onClick: () => removeTask(task.id),
-            title: isUser ? t('remove') : t('removeModel'),
-          }, '✕'),
         );
       });
 
@@ -840,6 +928,15 @@ window.__ModuleLoader__.load({
       // ---- expanded card -----------------------------------------------------
       return h('div', { style: wrapStyle, 'data-task-manager': '', 'data-tm-ui': '1' },
         h('div', { style: styles.card },
+          // Left-edge resize handle (grab it and drag left/right).
+          h('div', {
+            style: styles.resizeHandle,
+            onMouseDown: beginResize,
+            title: t('resizeHint'),
+            'aria-label': t('resizeHint'),
+            role: 'separator',
+            'data-tm-resize': '1',
+          }),
           h('div', { style: styles.header, onMouseDown: beginDrag, title: t('dragHint') },
             h('span', { style: styles.headerIcon }, h(TaskGlyph, { size: 15 })),
             h('span', { style: styles.title }, t('title')),
@@ -919,7 +1016,10 @@ window.__ModuleLoader__.load({
       );
     }
 
-    function makeStyles() {
+    function makeStyles(opts) {
+      // Live width of the expanded card (null = default). Passed in rather than
+      // read from a closure so the sheet stays a pure function of the props.
+      const cardWidth = opts && typeof opts.width === 'number' ? opts.width : null;
       // Theme tokens follow light/dark automatically (see listTokens). Never
       // bake a light-mode hex here as the primary value: an unknown var() falls
       // back to it and the panel goes unreadable in dark mode. The 2nd argument
@@ -1052,17 +1152,33 @@ window.__ModuleLoader__.load({
           whiteSpace: 'nowrap',
         },
         card: {
-          // Expanded card width (was 510, then 340, now 400).
-          width: '400px',
+          // Expanded card width. The task text lives on its own line now, but a
+          // 400px card still felt cramped for Chinese task text, so the default is
+          // wider (still capped by the viewport) and the user can drag the left
+          // edge to resize — see `cardWidth` / `beginResize`.
+          width: cardWidth ? `${cardWidth}px` : 'min(560px, calc(100vw - 40px))',
           maxWidth: 'calc(100vw - 40px)',
           maxHeight: 'min(60vh, 520px)',
           display: 'flex',
           flexDirection: 'column',
+          position: 'relative',
           borderRadius: '12px',
           border: `1px solid ${C.border}`,
           background: C.overlay,
           boxShadow: '0 12px 32px rgba(0,0,0,0.36)',
           overflow: 'hidden',
+        },
+        // Grab strip on the card's left edge. The card is anchored bottom-right,
+        // so dragging this edge left grows it without moving the corner the user
+        // already positioned.
+        resizeHandle: {
+          position: 'absolute',
+          left: 0,
+          top: 0,
+          bottom: 0,
+          width: '6px',
+          cursor: 'ew-resize',
+          zIndex: 1,
         },
         header: {
           display: 'flex',
@@ -1088,13 +1204,16 @@ window.__ModuleLoader__.load({
         },
         body: { padding: '10px 12px', overflow: 'auto' },
         bodyInner: { display: 'flex', flexDirection: 'column', gap: '8px' },
-        list: { listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: '4px' },
+        list: { listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: '6px' },
+        // Two-line row: head (dot + badges + buttons) above the task text.
         row: {
-          display: 'flex', alignItems: 'flex-start', gap: '6px',
-          padding: '6px 8px', borderRadius: '8px',
+          display: 'flex', flexDirection: 'column', gap: '4px',
+          padding: '6px 9px 7px', borderRadius: '8px',
           border: `1px solid ${C.border}`,
           background: C.surface2,
         },
+        rowHead: { display: 'flex', alignItems: 'center', gap: '6px', minWidth: 0 },
+        rowSpacer: { flex: '1 1 auto', minWidth: 0, height: '1px' },
         dot: { width: '9px', height: '9px', borderRadius: '50%', flex: '0 0 auto' },
         // Text state chip: colour reinforces, but the WORD carries the state.
         statusChip: {
@@ -1114,8 +1233,10 @@ window.__ModuleLoader__.load({
           color: C.text2,
           whiteSpace: 'nowrap',
         },
-        label: { flex: '1 1 auto', minWidth: 0, display: 'flex', flexDirection: 'column', gap: '1px', color: C.text },
-        labelTitle: { overflowWrap: 'anywhere', wordBreak: 'break-word', whiteSpace: 'normal', lineHeight: '18px' },
+        // The task text spans the whole row width; wrapping is normal, breaking
+        // mid-token is only the last resort.
+        label: { display: 'flex', flexDirection: 'column', gap: '1px', minWidth: 0, color: C.text },
+        labelTitle: { overflowWrap: 'anywhere', wordBreak: 'break-word', whiteSpace: 'normal', lineHeight: '18px', fontSize: '13px' },
         labelDetail: { overflowWrap: 'anywhere', wordBreak: 'break-word', whiteSpace: 'normal', color: C.text2, fontSize: '11px', lineHeight: '16px' },
         doneLabel: { textDecoration: 'line-through', opacity: 0.65 },
         btn: {
