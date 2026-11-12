@@ -72,7 +72,29 @@ function normalizeTask(raw) {
   // `proposedDone` marks a task the model believes is complete but which awaits
   // the user's confirmation in the floating card. Only meaningful with done.
   if (raw.proposedDone === true && status === 'done') task.proposedDone = true;
+  // `archivedAt` hides a task from the active list while KEEPING it in the same
+  // list (archived, not deleted): the card offers a separate archive view, and
+  // the record survives a reload/fork because it never leaves the session log.
+  // Only a done task can be archived — an unfinished task has nothing to file.
+  const archivedAt = normalizeArchivedAt(raw.archivedAt);
+  if (archivedAt !== undefined && status === 'done') task.archivedAt = archivedAt;
   return task;
+}
+
+/** Accept an ISO timestamp (or ms epoch) as an archive stamp; anything else is ignored. */
+function normalizeArchivedAt(value) {
+  if (typeof value === 'string' && value.length > 0) {
+    const ms = Date.parse(value);
+    if (Number.isFinite(ms)) return new Date(ms).toISOString();
+    return undefined;
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) return new Date(value).toISOString();
+  return undefined;
+}
+
+/** True when a task is filed in the archive instead of the active list. */
+function isArchived(task) {
+  return typeof task.archivedAt === 'string' && task.archivedAt.length > 0;
 }
 
 /** Case- and width-insensitive, punctuation-free form used for title matching. */
@@ -161,16 +183,31 @@ function decodeStateFromText(text) {
 /** Human-readable + marker rendering of a tool result for the given task list. */
 function renderState(tasks) {
   const counts = { todo: 0, doing: 0, done: 0 };
-  for (const task of tasks) counts[task.status] = (counts[task.status] || 0) + 1;
+  let archived = 0;
+  for (const task of tasks) {
+    if (isArchived(task)) {
+      archived += 1;
+      continue;
+    }
+    counts[task.status] = (counts[task.status] || 0) + 1;
+  }
+  const doneNote = archived > 0 ? `${counts.done} done, ${archived} archived` : `${counts.done} done`;
   const lines = [
-    `Task list updated: ${counts.todo} to do, ${counts.doing} in progress, ${counts.done} done.`,
+    `Task list updated: ${counts.todo} to do, ${counts.doing} in progress, ${doneNote}.`,
   ];
-  if (tasks.length > 0) {
+  // The model only needs the ACTIVE list — archived tasks are filed away, and
+  // replaying them every turn would drown the real working set. They are still
+  // carried in the marker line, so `list` and the Client archive view see them.
+  const active = tasks.filter((task) => !isArchived(task));
+  if (active.length > 0) {
     lines.push('Current tasks:');
-    for (const task of tasks) {
+    for (const task of active) {
       const mark = task.status === 'done' && task.proposedDone ? 'done, awaiting confirmation' : task.status;
       lines.push(`- [${mark}] ${task.title}${task.id ? ` (${task.id})` : ''}`);
     }
+  }
+  if (archived > 0) {
+    lines.push(`(${archived} archived task(s) hidden; archive view is in the task card.)`);
   }
   lines.push('');
   lines.push(encodeState(tasks));
@@ -229,6 +266,50 @@ function applyAction(action, args, current) {
       tasks.splice(idx, 1);
       return tasks;
     }
+    case 'archive': {
+      // File one or more DONE tasks into the archive. This is what the card's
+      // "archive done" button does instead of deleting them, so a finished list
+      // can be cleared without losing the record. `ids` (batch) and `id` (single)
+      // are both accepted; without either, every done, non-pending task in the
+      // active list is archived (the bulk button's payload).
+      const targets = [];
+      if (Array.isArray(args.ids) && args.ids.length > 0) {
+        for (const ref of args.ids) targets.push(resolveTask(tasks, ref));
+      } else if (typeof args.id === 'string' && args.id.length > 0) {
+        targets.push(resolveTask(tasks, args.id));
+      } else {
+        for (const task of tasks) {
+          if (task.status === 'done' && task.proposedDone !== true && !isArchived(task)) targets.push(task);
+        }
+      }
+      if (targets.length === 0) return tasks;
+      const stamp = normalizeArchivedAt(args.at) || new Date().toISOString();
+      for (const task of targets) {
+        // An unfinished task has nothing to file away; skip rather than lying
+        // about it, so a mixed batch archives exactly its done members.
+        if (task.status !== 'done') continue;
+        delete task.proposedDone;
+        task.archivedAt = stamp;
+      }
+      return tasks;
+    }
+    case 'unarchive': {
+      // Restore archived tasks to the active list (still done).
+      const targets = [];
+      if (Array.isArray(args.ids) && args.ids.length > 0) {
+        for (const ref of args.ids) targets.push(resolveTask(tasks, ref));
+      } else if (typeof args.id === 'string' && args.id.length > 0) {
+        targets.push(resolveTask(tasks, args.id));
+      } else {
+        const all = args.all === true;
+        for (const task of tasks) {
+          if (all || task.id === args.id) targets.push(task);
+        }
+      }
+      if (targets.length === 0) throw new Error('unarchive needs `id`, `ids`, or `all: true`');
+      for (const task of targets) if (task.archivedAt !== undefined) delete task.archivedAt;
+      return tasks;
+    }
     case 'replace': {
       if (!Array.isArray(args.tasks)) throw new Error('`tasks` must be an array');
       // Reuse the id of an existing task whose title matches the incoming one.
@@ -247,6 +328,11 @@ function applyAction(action, args, current) {
           const at = available.findIndex((candidate) => foldTitle(candidate.title) === folded);
           if (at >= 0) {
             task.id = available[at].id;
+            // A rewrite must not silently UN-archive (or re-archive) a task: the
+            // archive is the user's filing decision, not part of the plan text.
+            if (available[at].archivedAt !== undefined && task.status === 'done') {
+              task.archivedAt = available[at].archivedAt;
+            }
             available.splice(at, 1);
           }
         }
@@ -263,7 +349,7 @@ function applyAction(action, args, current) {
     case null:
       return tasks;
     default:
-      throw new Error(`unknown action ${JSON.stringify(action)}; use add, set_status, remove, replace, clear or list`);
+      throw new Error(`unknown action ${JSON.stringify(action)}; use add, set_status, propose_done, archive, unarchive, remove, replace, clear or list`);
   }
 }
 
@@ -362,8 +448,8 @@ async function apply(ctx) {
       properties: {
         action: {
           type: 'string',
-          enum: ['add', 'set_status', 'propose_done', 'remove', 'replace', 'clear', 'list'],
-          description: 'add: append one task; set_status: change one task status by id; propose_done: mark one or more tasks DONE pending the user\'s confirmation (use this to report completion; accepts ids or unique titles); remove: delete by id; replace: set the whole list (use for an ordered plan); clear: empty the list; list: read without changing.',
+          enum: ['add', 'set_status', 'propose_done', 'archive', 'unarchive', 'remove', 'replace', 'clear', 'list'],
+          description: 'add: append one task; set_status: change one task status by id; propose_done: mark one or more tasks DONE pending the user\'s confirmation (use this to report completion; accepts ids or unique titles); archive: file DONE tasks into the archive (hidden from the active list, still queryable via list) — this is how the card clears finished work instead of deleting it; unarchive: put archived tasks back; remove: delete by id; replace: set the whole list (use for an ordered plan); clear: empty the list; list: read without changing.',
         },
         title: { type: 'string', description: 'For action "add": the task title.' },
         detail: { type: 'string', description: 'For action "add": optional one-line detail.' },
@@ -371,9 +457,11 @@ async function apply(ctx) {
         id: { type: 'string', description: 'For "set_status" / "remove" / single-target "propose_done": the task id (propose_done also accepts a title that uniquely identifies one task).' },
         ids: {
           type: 'array',
-          description: 'For action "propose_done": the tasks to mark done pending confirmation (batch). Each entry is a task id, or a title — a title must identify exactly one task (exact match, or a unique prefix, ignoring case/whitespace/punctuation); ambiguous titles are rejected. Use "list" first if unsure.',
+          description: 'For action "propose_done" (tasks to mark done pending confirmation) or "archive" / "unarchive" (tasks to file / restore) (batch). Each entry is a task id, or a title — a title must identify exactly one task (exact match, or a unique prefix, ignoring case/whitespace/punctuation); ambiguous titles are rejected. Use "list" first if unsure.',
           items: { type: 'string' },
         },
+        all: { type: 'boolean', description: 'For action "unarchive": restore every archived task.' },
+        at: { type: 'string', description: 'For action "archive": ISO timestamp to record (defaults to now).' },
         position: { type: 'integer', description: 'For "add": 1-based insertion index; omit to append.' },
         origin: { type: 'string', enum: ['model', 'user'], description: 'For "add": who created the task (default model).' },
         tasks: {
@@ -389,6 +477,7 @@ async function apply(ctx) {
               status: { type: 'string', enum: STATUSES },
               detail: { type: 'string' },
               origin: { type: 'string', enum: ['model', 'user'] },
+              archivedAt: { type: 'string' },
             },
           },
         },
@@ -398,7 +487,7 @@ async function apply(ctx) {
       schema: {
         type: 'object',
         additionalProperties: false,
-        required: ['tasks', 'counts'],
+        required: ['tasks', 'counts', 'archived'],
         properties: {
           tasks: {
             type: 'array',
@@ -413,6 +502,7 @@ async function apply(ctx) {
                 origin: { type: 'string', enum: ['model', 'user'] },
                 detail: { type: 'string' },
                 proposedDone: { type: 'boolean' },
+                archivedAt: { type: 'string' },
               },
             },
           },
@@ -426,6 +516,7 @@ async function apply(ctx) {
               done: { type: 'integer' },
             },
           },
+          archived: { type: 'integer' },
         },
       },
       render: (_args, value) => renderState(value.tasks),
@@ -433,9 +524,14 @@ async function apply(ctx) {
     execute(args, exec) {
       if (!exec.agent) throw new Error('task_write requires an owning agent session');
       const next = applyAction(args.action, args, currentTasks(exec.agent));
+      // Archived tasks are filed away, so they must not inflate the working
+      // counts the card and the model both read.
       const counts = { todo: 0, doing: 0, done: 0 };
-      for (const task of next) counts[task.status] = (counts[task.status] || 0) + 1;
-      return Promise.resolve({ tasks: next, counts });
+      for (const task of next) if (!isArchived(task)) counts[task.status] = (counts[task.status] || 0) + 1;
+      // `archived` rides along so the model can tell "3 done" apart from "3 done,
+      // 10 filed away" without having to parse the rendered text.
+      const archivedCount = next.filter(isArchived).length;
+      return Promise.resolve({ tasks: next, counts, archived: archivedCount });
     },
     presentCall: (args) => ({
       card: 'generic',

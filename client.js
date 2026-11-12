@@ -65,7 +65,15 @@ window.__ModuleLoader__.load({
       originModel: 'Proposed by the model',
       originUser: 'Added by you',
       noSession: 'Open a conversation to use the task panel.',
-      clearDone: 'Clear done',
+      archiveDone: 'Archive done',
+      archive: 'Archive',
+      archiveTitle: 'Archive',
+      archiveEmpty: 'No archived tasks yet.',
+      archiveHint: 'Archived tasks are kept, not deleted.',
+      restore: 'Restore',
+      deleteForever: 'Delete forever',
+      showArchive: 'Archive',
+      backToTasks: 'Back to list',
       openPanel: 'Show tasks',
       collapse: 'Collapse',
       dragHint: 'Drag to move',
@@ -111,7 +119,15 @@ window.__ModuleLoader__.load({
       originModel: '由模型建议',
       originUser: '由你添加',
       noSession: '打开一个对话即可使用任务面板。',
-      clearDone: '清除已完成',
+      archiveDone: '归档已完成',
+      archive: '归档',
+      archiveTitle: '归档',
+      archiveEmpty: '还没有归档的任务。',
+      archiveHint: '归档只移出列表，不会删除。',
+      restore: '恢复',
+      deleteForever: '彻底删除',
+      showArchive: '归档',
+      backToTasks: '返回列表',
       openPanel: '显示任务',
       collapse: '收起',
       dragHint: '拖动移动位置',
@@ -135,6 +151,20 @@ window.__ModuleLoader__.load({
       syncDismiss: '知道了',
       resizeHint: '拖动调整宽度',
     };
+
+    // Archived stamps are stored as ISO strings. Show a short, locale-neutral
+    // "MM-DD HH:mm" (same year) or "YYYY-MM-DD" otherwise — enough to answer
+    // "when did I finish this?" without spending a whole row on it.
+    function formatArchivedAt(value) {
+      if (typeof value !== 'string' || value.length === 0) return '';
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return '';
+      const pad = (n) => String(n).padStart(2, '0');
+      const sameYear = date.getFullYear() === new Date().getFullYear();
+      const md = `${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+      const hm = `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+      return sameYear ? `${md} ${hm}` : `${date.getFullYear()}-${md}`;
+    }
 
     function fill(template, vars) {
       return String(template).replace(/\{(\w+)\}/g, (_, k) => (vars[k] != null ? String(vars[k]) : ''));
@@ -523,6 +553,12 @@ window.__ModuleLoader__.load({
       // would look like it silently ignored the click: the list is host-owned now,
       // so a failed write means the row simply never appears.
       const [syncError, setSyncError] = React.useState(false);
+      // Which view the card shows. The archive is a separate view rather than a
+      // section, so a long history never pushes the working list out of reach.
+      const [view, setView] = React.useState('list');
+      // Deleting from the archive is destructive and irreversible, so it goes
+      // through one inline confirmation instead of firing on the first click.
+      const [deleteConfirm, setDeleteConfirm] = React.useState(null);
 
       // Drag-to-move: null = default anchored position (bottom-right). Once the
       // user drags, we pin an absolute {x,y} (top-left of the widget) instead and
@@ -708,15 +744,28 @@ window.__ModuleLoader__.load({
         write({ action: 'set_status', id, status });
       }
 
-      // "Clear done" removes every completed task that is NOT still awaiting the
-      // user's completion confirmation. Both origins live in the same host list
-      // now, so a single `remove` per task covers both.
-      function clearDoneTasks() {
-        for (const task of merged) {
-          if (task._pendingConfirm) continue;
-          if (task.status !== 'done') continue;
-          write({ action: 'remove', id: task.id });
-        }
+      // "Archive done" files every completed task that is NOT still awaiting the
+      // user's completion confirmation out of the active list. It used to DELETE
+      // them ("clear done"), which threw away the record of finished work; now a
+      // single `archive` write stamps `archivedAt` on the host tasks, so they move
+      // to the archive view and survive reload/fork. The host skips pending and
+      // unfinished tasks itself, so the payload stays a plain `{}`-ish object.
+      function archiveDoneTasks() {
+        write({ action: 'archive' });
+      }
+
+      function archiveOne(task) {
+        write({ action: 'archive', id: task.id });
+      }
+
+      function restoreTask(task) {
+        write({ action: 'unarchive', id: task.id });
+      }
+
+      // Deleting from the archive is the only truly destructive action left, so
+      // it asks first (a misclick in the archive used to be unrecoverable).
+      function deleteArchived(task) {
+        write({ action: 'remove', id: task.id });
       }
 
       // Ask before sending: the user asked for an explicit confirmation step so a
@@ -769,14 +818,22 @@ window.__ModuleLoader__.load({
           .filter((task) => task.origin === 'user')
           .map((task) => ({ ...task, _source: 'user', _pendingConfirm: false })),
       ];
+      // Archived tasks stay in the same host list (nothing is deleted) but are
+      // not part of the working set: they are excluded from the list, the counts
+      // and the pill badge, and are shown in their own view instead. Sorted
+      // newest-archived first so the view reads like a log.
+      const archivedRows = merged
+        .filter((task) => typeof task.archivedAt === 'string' && task.archivedAt.length > 0)
+        .sort((a, b) => String(b.archivedAt).localeCompare(String(a.archivedAt)));
+      const activeRows = merged.filter((task) => !(typeof task.archivedAt === 'string' && task.archivedAt.length > 0));
 
       // Tasks the model proposed as done that the user has not yet confirmed.
-      const pendingConfirms = merged.filter((task) => task._pendingConfirm);
+      const pendingConfirms = activeRows.filter((task) => task._pendingConfirm);
 
       // Count done only for confirmed/completed tasks; pending ones are surfaced
       // in the confirm banner rather than counted as finished.
       const counts = { todo: 0, doing: 0, done: 0 };
-      for (const task of merged) {
+      for (const task of activeRows) {
         if (task._pendingConfirm) continue;
         if (counts[task.status] != null) counts[task.status] += 1;
       }
@@ -834,7 +891,7 @@ window.__ModuleLoader__.load({
       // (a Chinese task became a vertical ribbon). Stacking gives the title the
       // full card width; the buttons only cost the header line, which is short by
       // nature.
-      const rows = merged.map((task) => {
+      const rows = activeRows.map((task) => {
         const isUser = task._source === 'user';
         const pending = task._pendingConfirm;
         const labelStyle = {
@@ -877,6 +934,35 @@ window.__ModuleLoader__.load({
             task.detail
               ? h('span', { style: styles.labelDetail }, task.detail)
               : null,
+          ),
+        );
+      });
+
+      // Archived rows: same two-line shape as the active rows, but the only
+      // actions left are restore and a confirmed delete. No status buttons and no
+      // "start" — a filed-away task is not part of the current work.
+      const archiveRows = archivedRows.map((task) => {
+        const isUser = task._source === 'user';
+        const stamp = formatArchivedAt(task.archivedAt);
+        return h('li', { key: `archived:${task.id}`, style: styles.row, 'data-tm-archived': '1' },
+          h('div', { style: styles.rowHead },
+            h('span', { style: { ...styles.dot, background: STATUS_COLOR.done } }),
+            h('span', { style: styles.badge, title: isUser ? t('originUser') : t('originModel') },
+              isUser ? t('fromUser') : t('fromModel')),
+            stamp ? h('span', { style: styles.archiveStamp }, stamp) : null,
+            h('span', { style: styles.rowSpacer }),
+            h('button', {
+              style: styles.btn, title: t('restore'),
+              onClick: () => restoreTask(task),
+            }, t('restore')),
+            h('button', {
+              style: styles.btn, title: t('deleteForever'),
+              onClick: () => setDeleteConfirm(task),
+            }, '✕'),
+          ),
+          h('span', { style: { ...styles.label, ...styles.doneLabel }, title: task.title },
+            h('span', { style: styles.labelTitle }, task.title),
+            task.detail ? h('span', { style: styles.labelDetail }, task.detail) : null,
           ),
         );
       });
@@ -941,8 +1027,24 @@ window.__ModuleLoader__.load({
             h('span', { style: styles.headerIcon }, h(TaskGlyph, { size: 15 })),
             h('span', { style: styles.title }, t('title')),
             h('span', { style: styles.counts }, countsText),
-            counts.done > 0
-              ? h('button', { style: styles.btn, onClick: clearDoneTasks, title: t('clearDone') }, t('clearDone'))
+            // Pushes the archive controls to the right edge; absorbs the shrink
+            // when the card is narrow so the buttons stay on one line.
+            h('span', { style: styles.headerSpacer }),
+            // Archive entry: always visible (with its count) so the archive is
+            // discoverable even when it is empty — this is the "query entry" for
+            // filed-away work.
+            h('button', {
+              style: view === 'archive' ? styles.activeBtn : styles.btn,
+              onClick: () => setView(view === 'archive' ? 'list' : 'archive'),
+              title: view === 'archive' ? t('backToTasks') : t('archiveHint'),
+              'data-tm-archive': '1',
+            },
+              t('showArchive'),
+              archivedRows.length > 0
+                ? h('span', { style: styles.archiveCount }, ` ${archivedRows.length}`)
+                : null),
+            counts.done > 0 && view === 'list'
+              ? h('button', { style: styles.btn, onClick: archiveDoneTasks, title: t('archiveHint'), 'data-tm-archive-done': '1' }, t('archiveDone'))
               : null,
             h('button', {
               style: styles.closeBtn,
@@ -989,10 +1091,41 @@ window.__ModuleLoader__.load({
                       }, t('syncDismiss')),
                     )
                   : null,
-                merged.length === 0
-                  ? h('div', { style: styles.empty }, t('empty'))
-                  : h('ul', { style: styles.list }, rows),
-                h('div', { style: styles.addRow },
+                deleteConfirm
+                  ? h('div', { style: styles.confirmBar },
+                      h('span', { style: styles.confirmText },
+                        `${t('deleteForever')} “${deleteConfirm.title}”?`),
+                      h('button', {
+                        style: styles.dangerBtn,
+                        onClick: () => { deleteArchived(deleteConfirm); setDeleteConfirm(null); },
+                      }, t('deleteForever')),
+                      h('button', {
+                        style: styles.btn,
+                        onClick: () => setDeleteConfirm(null),
+                      }, t('cancel')),
+                    )
+                  : null,
+                view === 'archive'
+                  ? h('div', { style: styles.bodyInner },
+                      h('div', { style: styles.archiveHead },
+                        h('span', { style: styles.counts }, `${t('archiveTitle')} · ${archivedRows.length}`),
+                        h('span', { style: styles.archiveHintText }, t('archiveHint')),
+                      ),
+                      archivedRows.length === 0
+                        ? h('div', { style: styles.empty }, t('archiveEmpty'))
+                        : h('ul', { style: styles.list, 'data-tm-archive-list': '1' }, archiveRows),
+                    )
+                  : activeRows.length === 0 && merged.length > 0
+                    ? h('div', { style: styles.bodyInner },
+                        h('div', { style: styles.empty }, t('empty')),
+                        h('button', { style: styles.btn, onClick: () => setView('archive') }, `${t('showArchive')} ${archivedRows.length}`),
+                      )
+                    : activeRows.length === 0
+                      ? h('div', { style: styles.empty }, t('empty'))
+                      : h('ul', { style: styles.list }, rows),
+                view === 'archive'
+                  ? null
+                  : h('div', { style: styles.addRow },
                   h('input', {
                     style: styles.input,
                     value: draft,
@@ -1191,7 +1324,7 @@ window.__ModuleLoader__.load({
         },
         headerIcon: { display: 'inline-flex', color: C.accent },
         title: { fontWeight: 600, fontSize: '14px', color: C.text },
-        counts: { color: C.text2, fontSize: '11px', marginLeft: 'auto' },
+        counts: { color: C.text2, fontSize: '11px', minWidth: '0px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
         closeBtn: {
           flex: '0 0 auto',
           border: 'none',
@@ -1203,6 +1336,28 @@ window.__ModuleLoader__.load({
           borderRadius: '6px',
         },
         body: { padding: '10px 12px', overflow: 'auto' },
+        // Archive view: a quiet header line above the filed-away rows.
+        archiveHead: { display: 'flex', alignItems: 'baseline', gap: '8px', flexWrap: 'wrap', justifyContent: 'flex-start' },
+        archiveHintText: { color: C.text2, fontSize: '11px' },
+        archiveStamp: { color: C.text2, fontSize: '11px', whiteSpace: 'nowrap' },
+        // A count appended to the button label. Kept as plain dimmed text: a
+        // bordered pill inside a bordered button reads like a nested button.
+        archiveCount: { color: C.text2, fontVariantNumeric: 'tabular-nums' },
+        // Header button in its pressed/active state (the archive toggle while the
+        // archive view is open).
+        activeBtn: {
+          padding: '2px 8px', borderRadius: '6px', fontSize: '11px', lineHeight: '18px',
+          border: `1px solid ${C.border}`, background: C.surface2, color: C.text,
+          cursor: 'pointer', whiteSpace: 'nowrap', fontWeight: 600,
+        },
+        dangerBtn: {
+          padding: '2px 8px', borderRadius: '6px', fontSize: '11px', lineHeight: '18px',
+          border: '1px solid transparent', cursor: 'pointer', whiteSpace: 'nowrap',
+          // `danger` is the token already in C; its text comes from `onAccent`
+          // (the inverse neutral) rather than #fff, so it stays readable in both
+          // themes — see the note on `accent` in makeStyles.
+          background: C.danger, color: C.onAccent,
+        },
         bodyInner: { display: 'flex', flexDirection: 'column', gap: '8px' },
         list: { listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: '6px' },
         // Two-line row: head (dot + badges + buttons) above the task text.
