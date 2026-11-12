@@ -51,6 +51,10 @@ window.__ModuleLoader__.load({
       title: 'Tasks',
       empty: 'No tasks yet. Ask the model for a plan, or add one below.',
       addPlaceholder: 'Add a task…',
+      edit: 'Edit',
+      editTitlePlaceholder: 'Title',
+      editDetailPlaceholder: 'Detail (optional)',
+      save: 'Save',
       add: 'Add',
       start: 'Start',
       remove: 'Remove',
@@ -105,6 +109,10 @@ window.__ModuleLoader__.load({
       title: '任务',
       empty: '还没有任务。可以让模型给出实施顺序，或在下方添加。',
       addPlaceholder: '添加任务…',
+      edit: '编辑',
+      editTitlePlaceholder: '标题',
+      editDetailPlaceholder: '正文（可留空）',
+      save: '保存',
       add: '添加',
       start: '开始',
       remove: '删除',
@@ -556,6 +564,11 @@ window.__ModuleLoader__.load({
       // Which view the card shows. The archive is a separate view rather than a
       // section, so a long history never pushes the working list out of reach.
       const [view, setView] = React.useState('list');
+      // The task being edited inline (`{ id, title, detail }`) plus the draft the
+      // user is typing. The card's single add box only ever sets the title; this
+      // is where the second line (detail) becomes reachable for user tasks, and
+      // where a typo in an existing title gets fixed.
+      const [editing, setEditing] = React.useState(null);
       // Deleting from the archive is destructive and irreversible, so it goes
       // through one inline confirmation instead of firing on the first click.
       const [deleteConfirm, setDeleteConfirm] = React.useState(null);
@@ -744,6 +757,27 @@ window.__ModuleLoader__.load({
         write({ action: 'set_status', id, status });
       }
 
+      // Begin editing a row. Status/origin/archive stay untouched: the host
+      // `edit` action rewrites only the title and the detail line.
+      function beginEdit(task) {
+        setEditing({ id: task.id, title: task.title, detail: task.detail || '' });
+      }
+
+      function cancelEdit() {
+        setEditing(null);
+      }
+
+      // Commit the edit. A blank title is refused (the host would reject it too)
+      // rather than silently discarding the row; an unchanged draft is a no-op.
+      function commitEdit() {
+        if (!editing) return;
+        const title = editing.title.trim();
+        if (title.length === 0) return;
+        const detail = editing.detail.trim();
+        write({ action: 'edit', id: editing.id, title, detail });
+        setEditing(null);
+      }
+
       // "Archive done" files every completed task that is NOT still awaiting the
       // user's completion confirmation out of the active list. It used to DELETE
       // them ("clear done"), which threw away the record of finished work; now a
@@ -884,6 +918,59 @@ window.__ModuleLoader__.load({
         }, label);
       }
 
+      // Inline editor for one row: a title input, a detail input (the second,
+      // smaller line) and save/cancel. Enter saves, Escape cancels; Enter in the
+      // title moves on to the detail instead of saving, so the common "fix the
+      // title, add a note" pass does not need the mouse. IME composition is
+      // ignored for the same reason as the add box: the Enter that commits a
+      // Chinese candidate must not fire the action.
+      function editor(task) {
+        const commit = () => commitEdit();
+        const bump = (key) => (e) => setEditing((cur) => (cur ? { ...cur, [key]: e.target.value } : cur));
+        const guardEnter = (action) => (e) => {
+          if (e.key === 'Escape') {
+            e.preventDefault();
+            cancelEdit();
+            return;
+          }
+          if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return;
+          e.preventDefault();
+          action(e);
+        };
+        return h('span', { style: styles.editBox, 'data-tm-editor': task.id },
+          h('input', {
+            style: styles.editInput,
+            value: editing.title,
+            autoFocus: true,
+            placeholder: t('editTitlePlaceholder'),
+            onChange: bump('title'),
+            onKeyDown: guardEnter((e) => {
+              // Enter in the title continues to the detail line instead of saving.
+              const next = e.target.parentElement && e.target.parentElement.querySelector('[data-tm-edit-detail]');
+              if (next) next.focus();
+              else commit();
+            }),
+          }),
+          h('input', {
+            style: styles.editInputDetail,
+            value: editing.detail,
+            placeholder: t('editDetailPlaceholder'),
+            'data-tm-edit-detail': '1',
+            onChange: bump('detail'),
+            onKeyDown: guardEnter(commit),
+          }),
+          h('span', { style: styles.editActions },
+            h('button', {
+              style: styles.primaryBtn,
+              onClick: commit,
+              disabled: editing.title.trim().length === 0,
+              title: t('save'),
+            }, t('save')),
+            h('button', { style: styles.btn, onClick: cancelEdit, title: t('cancel') }, t('cancel')),
+          ),
+        );
+      }
+
       // One row = TWO lines: line 1 carries the small badges + the action
       // buttons, line 2 carries the task text. The old layout put every chip and
       // every button on the same flex line as the title, so at a 400px card the
@@ -920,21 +1007,35 @@ window.__ModuleLoader__.load({
             task.status === 'done'
               ? null
               : h('button', { style: styles.btn, onClick: () => requestStart(task), title: t('start') }, t('start')),
+            // Editing is offered for BOTH sources: the add box only ever set a
+            // title, so this is the only way a user task gets a detail line, and
+            // it is also how a model-written title gets a typo fixed.
+            editing && editing.id === task.id
+              ? null
+              : h('button', {
+                  style: styles.btn,
+                  onClick: () => beginEdit(task),
+                  title: t('edit'),
+                  'aria-label': t('edit'),
+                  'data-tm-edit': task.id,
+                }, '✎'),
             h('button', {
               style: styles.btn,
               onClick: () => removeTask(task.id),
               title: isUser ? t('remove') : t('removeModel'),
             }, '✕'),
           ),
-          h('span', {
-            style: labelStyle,
-            title: task.detail ? `${task.title} — ${task.detail}` : task.title,
-          },
-            h('span', { style: styles.labelTitle }, task.title),
-            task.detail
-              ? h('span', { style: styles.labelDetail }, task.detail)
-              : null,
-          ),
+          editing && editing.id === task.id
+            ? editor(task)
+            : h('span', {
+                style: labelStyle,
+                title: task.detail ? `${task.title} — ${task.detail}` : task.title,
+              },
+                h('span', { style: styles.labelTitle }, task.title),
+                task.detail
+                  ? h('span', { style: styles.labelDetail }, task.detail)
+                  : null,
+              ),
         );
       });
 
@@ -974,8 +1075,14 @@ window.__ModuleLoader__.load({
 
       // Wrap style: when dragged, pin to absolute x/y (top-left); otherwise keep
       // the default bottom-right anchor.
+      // A remembered x is clamped to the CURRENT viewport: a position saved on a
+      // wide screen (or a card dragged to the right edge) would otherwise put the
+      // card's right half off-screen in a narrow window, and the card is
+      // `position: fixed` so nothing scrolls it back.
+      const maxLeft = Math.max(0, (window.innerWidth || 0) - 24);
+      const clampedX = pos ? Math.max(0, Math.min(pos.x, maxLeft)) : 0;
       const wrapStyle = pos
-        ? { ...styles.wrap, left: `${pos.x}px`, top: `${pos.y}px`, right: 'auto', bottom: 'auto' }
+        ? { ...styles.wrap, left: `${clampedX}px`, top: `${pos.y}px`, right: 'auto', bottom: 'auto' }
         : styles.wrap;
 
       // A global page (plugin manager, settings, marketplace …) is not a
@@ -1182,6 +1289,13 @@ window.__ModuleLoader__.load({
           position: 'fixed',
           right: '20px',
           bottom: '88px',
+          // Anchor BOTH sides. A `position: fixed` wrapper is content-sized, so a
+          // card wider than the viewport pushed the wrapper itself past the right
+          // edge and half the card went off-screen (no scroll can reach it). With
+          // the left edge also pinned, the wrapper's width is `100vw - 40px` and
+          // the card can only ever shrink to fit.
+          left: '20px',
+          maxWidth: 'calc(100vw - 40px)',
           zIndex: 60,
           pointerEvents: 'auto',
           font: 'inherit',
@@ -1289,7 +1403,12 @@ window.__ModuleLoader__.load({
           // 400px card still felt cramped for Chinese task text, so the default is
           // wider (still capped by the viewport) and the user can drag the left
           // edge to resize — see `cardWidth` / `beginResize`.
-          width: cardWidth ? `${cardWidth}px` : 'min(560px, calc(100vw - 40px))',
+          // `width` is clamped again at render time: a width saved on a wide
+          // screen would otherwise overflow a narrow window, and the inline
+          // editor's full-width inputs made that overflow obvious.
+          // `width` only sets the PREFERRED width: the wrapper is pinned on both
+          // sides, so the card is still clipped to the window on narrow screens.
+          width: cardWidth ? `${cardWidth}px` : 'min(560px, 100%)',
           maxWidth: 'calc(100vw - 40px)',
           maxHeight: 'min(60vh, 520px)',
           display: 'flex',
@@ -1316,14 +1435,21 @@ window.__ModuleLoader__.load({
         header: {
           display: 'flex',
           alignItems: 'center',
+          // `minWidth: 0` + no-wrap buttons: a long title/count line ellipsises
+          // rather than growing the card past the viewport.
+          minWidth: '0px',
+          flexWrap: 'nowrap',
           gap: '8px',
           padding: '10px 12px',
           borderBottom: `1px solid ${C.border}`,
           cursor: 'move',
           userSelect: 'none',
         },
-        headerIcon: { display: 'inline-flex', color: C.accent },
-        title: { fontWeight: 600, fontSize: '14px', color: C.text },
+        headerIcon: { display: 'inline-flex', color: C.accent, flex: '0 0 auto' },
+        // Absorbs the shrink on a narrow card so the right-hand controls never
+        // wrap and the ✕ stays flush with the card's right edge.
+        headerSpacer: { flex: '1 1 auto', minWidth: '0px', height: '1px' },
+        title: { fontWeight: 600, fontSize: '14px', color: C.text, flex: '0 0 auto' },
         counts: { color: C.text2, fontSize: '11px', minWidth: '0px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
         closeBtn: {
           flex: '0 0 auto',
@@ -1406,6 +1532,21 @@ window.__ModuleLoader__.load({
           borderRadius: '7px', padding: '4px 12px', fontSize: '12px', cursor: 'pointer', whiteSpace: 'nowrap',
         },
         addRow: { display: 'flex', gap: '6px', marginTop: '4px' },
+        // Inline row editor: the title and detail inputs stack (same two-line
+        // rhythm as the read view) and the buttons sit at the end of the second
+        // line, so a narrow card still gets a usable input width.
+        editBox: { display: 'flex', flexDirection: 'column', gap: '4px', marginTop: '2px' },
+        editInput: {
+          width: '100%', boxSizing: 'border-box', padding: '4px 6px', fontSize: '12px',
+          color: C.text, background: C.surface, border: `1px solid ${C.border}`,
+          borderRadius: '6px', outline: 'none',
+        },
+        editInputDetail: {
+          width: '100%', boxSizing: 'border-box', padding: '3px 6px', fontSize: '11px',
+          color: C.text2, background: C.surface, border: `1px solid ${C.border}`,
+          borderRadius: '6px', outline: 'none',
+        },
+        editActions: { display: 'flex', gap: '6px', justifyContent: 'flex-end' },
         input: {
           flex: '1 1 auto', minWidth: 0,
           border: `1px solid ${C.border}`,

@@ -1,6 +1,6 @@
 {
   "name": "@caipj/dsh-task-manager",
-  "version": "1.1.9",
+  "version": "1.1.10",
   "private": false,
   "type": "module",
   "description": "Task manager for the DeepSeek Harness chat: tasks proposed by the model or added by the user, shown in a draggable floating panel, with origin badges and a confirm-before-done flow — click a task to hand it to the model.",

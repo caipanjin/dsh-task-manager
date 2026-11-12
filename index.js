@@ -235,6 +235,26 @@ function applyAction(action, args, current) {
       tasks.splice(pos, 0, task);
       return tasks;
     }
+    case 'edit': {
+      // Rewrite one task's title and/or detail WITHOUT touching its id, status,
+      // origin, completion proposal or archive stamp. This is what the card's
+      // "✎" button sends when the user fixes a typo or fills in the body text;
+      // `replace` cannot be used for that because it rebuilds the list from the
+      // incoming objects and would drop the per-task state the user set.
+      const task = resolveTask(tasks, args.id);
+      const title = typeof args.title === 'string' ? args.title.trim() : undefined;
+      if (title !== undefined && title.length === 0) throw new Error('`title` cannot be empty');
+      const detailProvided = Object.prototype.hasOwnProperty.call(args, 'detail');
+      if (title === undefined && !detailProvided) throw new Error('edit needs `title` and/or `detail`');
+      if (title !== undefined) task.title = title;
+      if (detailProvided) {
+        const detail = typeof args.detail === 'string' ? args.detail.trim() : '';
+        // An explicitly empty detail CLEARS it; the key being absent leaves it be.
+        if (detail.length > 0) task.detail = detail;
+        else delete task.detail;
+      }
+      return tasks;
+    }
     case 'set_status': {
       const task = tasks.find((candidate) => candidate.id === args.id);
       if (task === undefined) throw new Error(`no task with id ${JSON.stringify(args.id)}`);
@@ -349,7 +369,7 @@ function applyAction(action, args, current) {
     case null:
       return tasks;
     default:
-      throw new Error(`unknown action ${JSON.stringify(action)}; use add, set_status, propose_done, archive, unarchive, remove, replace, clear or list`);
+      throw new Error(`unknown action ${JSON.stringify(action)}; use add, edit, set_status, propose_done, archive, unarchive, remove, replace, clear or list`);
   }
 }
 
@@ -440,7 +460,7 @@ async function apply(ctx) {
   ctx.tools.register({
     name: 'task_write',
     description:
-      'Maintain this session\'s task list, shown in a floating task card in the bottom-right corner of the window (collapsed to a pill by default; click to expand — it stays on top of the conversation). IMPORTANT: whenever you lay out an ordered implementation plan or a multi-step set of next actions for the user (e.g. "1. do X, 2. do Y, 3. do Z"), ALSO record those steps as tasks here — use action "replace" with the full ordered list, or one "add" per step — so the user sees and can start them from the card instead of having to copy text manually. Also use it to add follow-up tasks and to report progress. To report that a task (or several) is COMPLETE, prefer action "propose_done" (pass `ids`): this marks the tasks done but AWAITING the user\'s confirmation, which the card surfaces as a bulk confirm prompt — do NOT use set_status done for completion unless the user explicitly told you they are done. `ids` entries may be task ids OR titles that uniquely identify a task, so you do not need to re-`list` just to recover an id. Use action "set_status" only to move a task to todo/doing or to apply a status the user explicitly requested. Task fields: id, title, status (todo|doing|done), origin (model|user). The tool returns the complete updated list; ids are stable and are how you later update or remove a task.',
+      'Maintain this session\'s task list, shown in a floating task card in the bottom-right corner of the window (collapsed to a pill by default; click to expand — it stays on top of the conversation). IMPORTANT: whenever you lay out an ordered implementation plan or a multi-step set of next actions for the user (e.g. "1. do X, 2. do Y, 3. do Z"), ALSO record those steps as tasks here — use action "replace" with the full ordered list, or one "add" per step — so the user sees and can start them from the card instead of having to copy text manually. Also use it to add follow-up tasks and to report progress. To report that a task (or several) is COMPLETE, prefer action "propose_done" (pass `ids`): this marks the tasks done but AWAITING the user\'s confirmation, which the card surfaces as a bulk confirm prompt — do NOT use set_status done for completion unless the user explicitly told you they are done. `ids` entries may be task ids OR titles that uniquely identify a task, so you do not need to re-`list` just to recover an id. Use action "set_status" only to move a task to todo/doing or to apply a status the user explicitly requested. Task fields: id, title, status (todo|doing|done), origin (model|user), detail (optional second line shown under the title). The tool returns the complete updated list; ids are stable and are how you later update or remove a task.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -448,13 +468,13 @@ async function apply(ctx) {
       properties: {
         action: {
           type: 'string',
-          enum: ['add', 'set_status', 'propose_done', 'archive', 'unarchive', 'remove', 'replace', 'clear', 'list'],
-          description: 'add: append one task; set_status: change one task status by id; propose_done: mark one or more tasks DONE pending the user\'s confirmation (use this to report completion; accepts ids or unique titles); archive: file DONE tasks into the archive (hidden from the active list, still queryable via list) — this is how the card clears finished work instead of deleting it; unarchive: put archived tasks back; remove: delete by id; replace: set the whole list (use for an ordered plan); clear: empty the list; list: read without changing.',
+          enum: ['add', 'edit', 'set_status', 'propose_done', 'archive', 'unarchive', 'remove', 'replace', 'clear', 'list'],
+          description: 'add: append one task; edit: rewrite one task\'s title and/or detail in place (id/status/origin/archive kept); set_status: change one task status by id; propose_done: mark one or more tasks DONE pending the user\'s confirmation (use this to report completion; accepts ids or unique titles); archive: file DONE tasks into the archive (hidden from the active list, still queryable via list) — this is how the card clears finished work instead of deleting it; unarchive: put archived tasks back; remove: delete by id; replace: set the whole list (use for an ordered plan); clear: empty the list; list: read without changing.',
         },
-        title: { type: 'string', description: 'For action "add": the task title.' },
-        detail: { type: 'string', description: 'For action "add": optional one-line detail.' },
+        title: { type: 'string', description: 'For action "add": the task title. For "edit": the new title (omit to keep it).' },
+        detail: { type: 'string', description: 'For actions "add" and "edit": optional detail (the smaller second line under the title). For "edit", passing an empty string clears it; omitting the key keeps it.' },
         status: { type: 'string', enum: STATUSES, description: 'For "add" (default todo) or "set_status": the target status.' },
-        id: { type: 'string', description: 'For "set_status" / "remove" / single-target "propose_done": the task id (propose_done also accepts a title that uniquely identifies one task).' },
+        id: { type: 'string', description: 'For "edit" / "set_status" / "remove" / single-target "propose_done": the task id (all of them also accept a title that uniquely identifies one task).' },
         ids: {
           type: 'array',
           description: 'For action "propose_done" (tasks to mark done pending confirmation) or "archive" / "unarchive" (tasks to file / restore) (batch). Each entry is a task id, or a title — a title must identify exactly one task (exact match, or a unique prefix, ignoring case/whitespace/punctuation); ambiguous titles are rejected. Use "list" first if unsure.',
