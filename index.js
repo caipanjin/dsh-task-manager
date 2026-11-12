@@ -181,7 +181,7 @@ function decodeStateFromText(text) {
 }
 
 /** Human-readable + marker rendering of a tool result for the given task list. */
-function renderState(tasks) {
+function renderState(tasks, carried) {
   const counts = { todo: 0, doing: 0, done: 0 };
   let archived = 0;
   for (const task of tasks) {
@@ -195,6 +195,20 @@ function renderState(tasks) {
   const lines = [
     `Task list updated: ${counts.todo} to do, ${counts.doing} in progress, ${doneNote}.`,
   ];
+  // A `replace` that carried tasks over must SAY so: otherwise the model reads
+  // its own rendered list, sees entries it did not just write, and concludes the
+  // write went wrong (or silently re-sends `replace` to "fix" it — which is the
+  // very loop that used to delete the user's tasks).
+  if (Array.isArray(carried) && carried.length > 0) {
+    const filed = carried.filter((task) => task.filed === true).map((task) => task.title);
+    const live = carried.filter((task) => task.filed !== true).map((task) => task.title);
+    if (live.length > 0) {
+      lines.push(`Kept from the previous list (not in this plan): ${live.map((title) => `"${title}"`).join(', ')}. Archive or remove them explicitly if they are done.`);
+    }
+    if (filed.length > 0) {
+      lines.push(`Moved to the archive (finished and not in this plan): ${filed.map((title) => `"${title}"`).join(', ')}.`);
+    }
+  }
   // The model only needs the ACTIVE list — archived tasks are filed away, and
   // replaying them every turn would drown the real working set. They are still
   // carried in the marker line, so `list` and the Client archive view see them.
@@ -220,6 +234,7 @@ function renderState(tasks) {
  */
 function applyAction(action, args, current) {
   const tasks = current.map((task) => ({ ...task }));
+  let carried = [];
   switch (action) {
     case 'add': {
       const task = normalizeTask({
@@ -233,7 +248,7 @@ function applyAction(action, args, current) {
         ? Math.min(args.position - 1, tasks.length)
         : tasks.length;
       tasks.splice(pos, 0, task);
-      return tasks;
+      return { tasks, carried };
     }
     case 'edit': {
       // Rewrite one task's title and/or detail WITHOUT touching its id, status,
@@ -253,16 +268,19 @@ function applyAction(action, args, current) {
         if (detail.length > 0) task.detail = detail;
         else delete task.detail;
       }
-      return tasks;
+      return { tasks, carried };
     }
     case 'set_status': {
-      const task = tasks.find((candidate) => candidate.id === args.id);
-      if (task === undefined) throw new Error(`no task with id ${JSON.stringify(args.id)}`);
+      // Resolved (not a bare id lookup) because models routinely forget the id
+      // and pass the title they can see in the card; the tool description has
+      // always promised that. Ambiguous titles still throw rather than guess.
+      if (args.id === undefined) throw new Error('set_status needs `id`');
+      const task = resolveTask(tasks, args.id);
       if (!STATUSES.includes(args.status)) throw new Error(`status must be one of ${STATUSES.join(', ')}`);
       task.status = args.status;
       // An explicit set_status is authoritative: clear any pending proposal.
       if (task.proposedDone !== undefined) delete task.proposedDone;
-      return tasks;
+      return { tasks, carried };
     }
     case 'propose_done': {
       // Mark one or more tasks as DONE-but-awaiting-user-confirmation. The user
@@ -278,13 +296,13 @@ function applyAction(action, args, current) {
         task.proposedDone = true;
         found.push(task);
       }
-      return tasks;
+      return { tasks, carried };
     }
     case 'remove': {
-      const idx = tasks.findIndex((candidate) => candidate.id === args.id);
-      if (idx < 0) throw new Error(`no task with id ${JSON.stringify(args.id)}`);
-      tasks.splice(idx, 1);
-      return tasks;
+      if (args.id === undefined) throw new Error('remove needs `id`');
+      const target = resolveTask(tasks, args.id);
+      tasks.splice(tasks.indexOf(target), 1);
+      return { tasks, carried };
     }
     case 'archive': {
       // File one or more DONE tasks into the archive. This is what the card's
@@ -302,7 +320,7 @@ function applyAction(action, args, current) {
           if (task.status === 'done' && task.proposedDone !== true && !isArchived(task)) targets.push(task);
         }
       }
-      if (targets.length === 0) return tasks;
+      if (targets.length === 0) return { tasks, carried };
       const stamp = normalizeArchivedAt(args.at) || new Date().toISOString();
       for (const task of targets) {
         // An unfinished task has nothing to file away; skip rather than lying
@@ -311,7 +329,7 @@ function applyAction(action, args, current) {
         delete task.proposedDone;
         task.archivedAt = stamp;
       }
-      return tasks;
+      return { tasks, carried };
     }
     case 'unarchive': {
       // Restore archived tasks to the active list (still done).
@@ -328,46 +346,98 @@ function applyAction(action, args, current) {
       }
       if (targets.length === 0) throw new Error('unarchive needs `id`, `ids`, or `all: true`');
       for (const task of targets) if (task.archivedAt !== undefined) delete task.archivedAt;
-      return tasks;
+      return { tasks, carried };
     }
     case 'replace': {
       if (!Array.isArray(args.tasks)) throw new Error('`tasks` must be an array');
-      // Reuse the id of an existing task whose title matches the incoming one.
-      // The tool description actively recommends `replace` for ordered plans, so
-      // a rewrite happens often; minting a fresh id every time silently dropped
-      // all per-task state the Client keeps by id (hidden / status edit /
-      // completion confirmation), because the Client can only store its answers
-      // locally and they are keyed on the id.
+      // `replace` rewrites the PLAN, not the history. It used to return exactly
+      // the incoming array, so a model that opened a new round with a fresh plan
+      // silently DELETED everything the previous plan still held — including the
+      // tasks it had just proposed as done and the user had not confirmed yet,
+      // and including tasks the user added by hand. Nothing was archived, so the
+      // work was simply gone. Now:
+      //  - an incoming entry matches an existing task by explicit `id`, else by
+      //    folded title, and INHERITS the fields it does not restate (status,
+      //    detail, origin, pending completion, archive stamp), so re-listing a
+      //    plan no longer resets progress back to `todo`;
+      //  - every existing task the new list does NOT mention is carried over:
+      //    finished-and-confirmed work is auto-ARCHIVED (filed, not deleted),
+      //    while open work and an unanswered completion proposal stay in the
+      //    active list. `clear` is the only action that actually empties it.
       const available = tasks.slice();
       const seen = new Set();
       const out = [];
       for (const raw of args.tasks) {
         const task = normalizeTask(raw);
-        if (typeof raw.id !== 'string' || raw.id.length === 0) {
+        let at = -1;
+        if (typeof raw.id === 'string' && raw.id.length > 0) {
+          at = available.findIndex((candidate) => candidate.id === raw.id);
+        }
+        if (at < 0) {
           const folded = foldTitle(task.title);
-          const at = available.findIndex((candidate) => foldTitle(candidate.title) === folded);
-          if (at >= 0) {
-            task.id = available[at].id;
-            // A rewrite must not silently UN-archive (or re-archive) a task: the
-            // archive is the user's filing decision, not part of the plan text.
-            if (available[at].archivedAt !== undefined && task.status === 'done') {
-              task.archivedAt = available[at].archivedAt;
-            }
-            available.splice(at, 1);
+          at = available.findIndex((candidate) => foldTitle(candidate.title) === folded);
+        }
+        if (at >= 0) {
+          const prev = available[at];
+          task.id = prev.id;
+          // An omitted field means "leave it as it is", not "reset it": a plan
+          // rewrite that only restates titles must not undo progress.
+          if (raw.status === undefined) task.status = prev.status;
+          if (raw.detail === undefined && prev.detail !== undefined) task.detail = prev.detail;
+          if (raw.origin === undefined) task.origin = prev.origin;
+          if (prev.proposedDone === true && task.status === 'done') task.proposedDone = true;
+          // A rewrite must not silently UN-archive (or re-archive) a task: the
+          // archive is the user's filing decision, not part of the plan text.
+          if (prev.archivedAt !== undefined && task.status === 'done') {
+            task.archivedAt = prev.archivedAt;
           }
+          available.splice(at, 1);
         }
         if (seen.has(task.id)) task.id = mintId();
         seen.add(task.id);
         out.push(task);
       }
-      return out;
+      const stamp = new Date().toISOString();
+      for (const prev of available) {
+        // Finished and already confirmed: the plan moved on, so file it away.
+        // The record survives in the archive view instead of vanishing.
+        if (prev.status === 'done' && prev.proposedDone !== true && !isArchived(prev)) {
+          out.push({ ...prev, archivedAt: stamp });
+          carried.push({ title: prev.title, filed: true });
+          continue;
+        }
+        // Open work, and a completion proposal the user has NOT answered yet,
+        // are still live: keep them with their id, status and detail intact.
+        out.push({ ...prev });
+        carried.push({ title: prev.title, filed: false });
+      }
+      return { tasks: out, carried };
     }
-    case 'clear':
-      return [];
+    case 'clear': {
+      // Emptying the WORKING list must not wipe the archive, and finished work
+      // is filed rather than destroyed: done tasks get an archive stamp, tasks
+      // already archived stay archived, and only genuinely open tasks are
+      // dropped — that is what an explicit `clear` asks for.
+      const stamp = new Date().toISOString();
+      const out = [];
+      for (const task of tasks) {
+        if (isArchived(task)) {
+          out.push({ ...task });
+          continue;
+        }
+        if (task.status === 'done') {
+          const filed = { ...task, archivedAt: stamp };
+          delete filed.proposedDone;
+          out.push(filed);
+          carried.push({ title: task.title, filed: true });
+        }
+      }
+      return { tasks: out, carried };
+    }
     case 'list':
     case undefined:
     case null:
-      return tasks;
+      return { tasks, carried };
     default:
       throw new Error(`unknown action ${JSON.stringify(action)}; use add, edit, set_status, propose_done, archive, unarchive, remove, replace, clear or list`);
   }
@@ -460,7 +530,7 @@ async function apply(ctx) {
   ctx.tools.register({
     name: 'task_write',
     description:
-      'Maintain this session\'s task list, shown in a floating task card in the bottom-right corner of the window (collapsed to a pill by default; click to expand — it stays on top of the conversation). IMPORTANT: whenever you lay out an ordered implementation plan or a multi-step set of next actions for the user (e.g. "1. do X, 2. do Y, 3. do Z"), ALSO record those steps as tasks here — use action "replace" with the full ordered list, or one "add" per step — so the user sees and can start them from the card instead of having to copy text manually. Also use it to add follow-up tasks and to report progress. To report that a task (or several) is COMPLETE, prefer action "propose_done" (pass `ids`): this marks the tasks done but AWAITING the user\'s confirmation, which the card surfaces as a bulk confirm prompt — do NOT use set_status done for completion unless the user explicitly told you they are done. `ids` entries may be task ids OR titles that uniquely identify a task, so you do not need to re-`list` just to recover an id. Use action "set_status" only to move a task to todo/doing or to apply a status the user explicitly requested. Task fields: id, title, status (todo|doing|done), origin (model|user), detail (optional second line shown under the title). The tool returns the complete updated list; ids are stable and are how you later update or remove a task.',
+      'Maintain this session\'s task list, shown in a floating task card in the bottom-right corner of the window (collapsed to a pill by default; click to expand — it stays on top of the conversation). IMPORTANT: whenever you lay out an ordered implementation plan or a multi-step set of next actions for the user (e.g. "1. do X, 2. do Y, 3. do Z"), ALSO record those steps as tasks here — use action "replace" with the full ordered list, or one "add" per step — so the user sees and can start them from the card instead of having to copy text manually. Also use it to add follow-up tasks and to report progress. To report that a task (or several) is COMPLETE, prefer action "propose_done" (pass `ids`): this marks the tasks done but AWAITING the user\'s confirmation, which the card surfaces as a bulk confirm prompt — do NOT use set_status done for completion unless the user explicitly told you they are done. `ids` entries may be task ids OR titles that uniquely identify a task, so you do not need to re-`list` just to recover an id. Use action "set_status" only to move a task to todo/doing or to apply a status the user explicitly requested. Task fields: id, title, status (todo|doing|done), origin (model|user), detail (optional second line shown under the title). The tool returns the complete updated list; ids are stable and are how you later update or remove a task. Never open a new round by calling "replace" with a fresh list to get rid of old tasks: `replace` rewrites the plan but keeps the tasks you omit (archiving the finished ones), so stale tasks must be archived or removed deliberately — and a completion the user has not confirmed yet is never dropped by a rewrite.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -469,7 +539,7 @@ async function apply(ctx) {
         action: {
           type: 'string',
           enum: ['add', 'edit', 'set_status', 'propose_done', 'archive', 'unarchive', 'remove', 'replace', 'clear', 'list'],
-          description: 'add: append one task; edit: rewrite one task\'s title and/or detail in place (id/status/origin/archive kept); set_status: change one task status by id; propose_done: mark one or more tasks DONE pending the user\'s confirmation (use this to report completion; accepts ids or unique titles); archive: file DONE tasks into the archive (hidden from the active list, still queryable via list) — this is how the card clears finished work instead of deleting it; unarchive: put archived tasks back; remove: delete by id; replace: set the whole list (use for an ordered plan); clear: empty the list; list: read without changing.',
+          description: 'add: append one task; edit: rewrite one task\'s title and/or detail in place (id/status/origin/archive kept); set_status: change one task status by id; propose_done: mark one or more tasks DONE pending the user\'s confirmation (use this to report completion; accepts ids or unique titles); archive: file DONE tasks into the archive (hidden from the active list, still queryable via list) — this is how the card clears finished work instead of deleting it; unarchive: put archived tasks back; remove: delete by id (the ONLY action that destroys a record — avoid it for work the user may still want); replace: rewrite the plan with the full ordered list, keeping the id of any task whose title matches and INHERITING the fields you do not restate (status, detail, origin, pending confirmation, archive stamp) — tasks the new list omits are not deleted: finished ones are archived automatically and open ones (including a completion the user has not confirmed yet) stay in the list; clear: empty the active list, filing finished tasks into the archive instead of destroying them; list: read without changing.',
         },
         title: { type: 'string', description: 'For action "add": the task title. For "edit": the new title (omit to keep it).' },
         detail: { type: 'string', description: 'For actions "add" and "edit": optional detail (the smaller second line under the title). For "edit", passing an empty string clears it; omitting the key keeps it.' },
@@ -486,7 +556,7 @@ async function apply(ctx) {
         origin: { type: 'string', enum: ['model', 'user'], description: 'For "add": who created the task (default model).' },
         tasks: {
           type: 'array',
-          description: 'For action "replace": the complete ordered task list.',
+          description: 'For action "replace": the complete ordered task list. Entries are matched to existing tasks by `id` or by title, so restating a task keeps its id and progress; anything you omit from the fields is carried over. Tasks from the previous list that you do not mention are kept (finished ones archived, open ones left in place) rather than deleted.',
           items: {
             type: 'object',
             additionalProperties: false,
@@ -537,13 +607,25 @@ async function apply(ctx) {
             },
           },
           archived: { type: 'integer' },
+          carried: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['title', 'filed'],
+              properties: {
+                title: { type: 'string' },
+                filed: { type: 'boolean' },
+              },
+            },
+          },
         },
       },
-      render: (_args, value) => renderState(value.tasks),
+      render: (_args, value) => renderState(value.tasks, value.carried),
     },
     execute(args, exec) {
       if (!exec.agent) throw new Error('task_write requires an owning agent session');
-      const next = applyAction(args.action, args, currentTasks(exec.agent));
+      const { tasks: next, carried } = applyAction(args.action, args, currentTasks(exec.agent));
       // Archived tasks are filed away, so they must not inflate the working
       // counts the card and the model both read.
       const counts = { todo: 0, doing: 0, done: 0 };
@@ -551,7 +633,7 @@ async function apply(ctx) {
       // `archived` rides along so the model can tell "3 done" apart from "3 done,
       // 10 filed away" without having to parse the rendered text.
       const archivedCount = next.filter(isArchived).length;
-      return Promise.resolve({ tasks: next, counts, archived: archivedCount });
+      return Promise.resolve({ tasks: next, counts, archived: archivedCount, carried });
     },
     presentCall: (args) => ({
       card: 'generic',
@@ -597,7 +679,7 @@ async function apply(ctx) {
           }
           try {
             const current = currentTasks(invocation.agent);
-            const next = applyAction(payload.action, payload, current);
+            const next = applyAction(payload.action, payload, current).tasks;
             return { kind: 'success', text: encodeState(next) };
           } catch (error) {
             return { kind: 'error', text: `tasks-sync: ${error instanceof Error ? error.message : String(error)}` };
