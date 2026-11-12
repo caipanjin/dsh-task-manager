@@ -41,7 +41,8 @@
     "icon.svg",
     "README.md",
     "LICENSE",
-    "docs/*.png"
+    "docs/*.png",
+    "docs/*.md"
   ],
   "dsh": {
     "bundle": {
