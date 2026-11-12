@@ -24,7 +24,7 @@
 
 ## 安装
 
-已发布到 npm（当前版本 **1.1.13**，历史版本见下方[更新记录](#更新记录)）：
+已发布到 npm（当前版本 **1.1.12**，历史版本见下方[更新记录](#更新记录)）：
 
 ```bash
 dsh plugin --profile web add @caipj/dsh-task-manager
